@@ -1,1174 +1,980 @@
-// FusionTracker.cs
-// Sensor-Fusion Tracking System — AIR Group, ESI-UCLM
-//
-// Tracker individual por cubo. Fusiona la orientación del IMU (BLE) con la
-// posición + yaw de los keypoints (YOLO + depth map) para generar un pose
-// 6-DoF estable y con baja latencia para el gemelo digital del cubo.
-//
-// Arquitectura de fusión:
-//   BLE (IMU+FSR, 15-30 Hz) + Visión (YOLO+Depth, 1-5 Hz) → FusionTracker
-//     → Calibración yaw, Lerp de posición, Detección de grip, Bloqueo de cara
-//     → Gemelo digital (visualObject) con pose 6-DoF estable
-//
-// Calibración de yaw (3 caminos, añadidos incrementalmente según necesidades):
-//   1. INITIAL — Primera calibración: se aplica inmediata, 3 frames de estabilidad.
-//   2. POST-RELEASE — Tras soltar el cubo: una corrección inmediata si la detección
-//      es buena (4/4 kpts + geo válido), si no llega en 5s se desiste.
-//   3. ONGOING — Acumula muestras en un buffer, calcula la mediana, y si son
-//      consistentes (diferencia < 20°) aplica la corrección. Espera 2s entre
-//      correcciones. Si el error es grande (>15°) corrige de golpe, si no suaviza.
-//
-// Grip — El FSR (sensor de presión) usa umbrales distintos para entrar y salir
-// del grip (más alto para entrar, más bajo para salir) para evitar rebotes.
-// Durante grip: rotación 3D completa del IMU + posición de la mano.
-// Al soltar: recaptura el offset completo preservando qué cara está abajo.
-//
-// Bloqueo de cara — Cuando el cubo está en la mesa, detecta cuál de las 6 caras
-// está abajo y la bloquea contra el suelo. Solo deja rotar en yaw (giro horizontal).
-// Usa un margen para no cambiar de cara por ruido del sensor.
-//
-// Gyro bias — Estimación opcional del drift del giroscopio durante reposo.
-// Desactivado por defecto. Los IMUs 6-ejes (sin magnetómetro) derivan en yaw
-// con el tiempo; esto lo mide cuando el cubo está quieto y lo compensa.
-//
-// Historial relevante:
-//   - Los tres paths de calibración se fueron añadiendo según surgían problemas:
-//     primero el initial, luego el ongoing, luego el post-release.
-//   - El symmetry snap de 90° venía del branch de QR codes y se desactivó porque
-//     bloqueaba las correcciones y rompía el cambio de ejes por cara.
-//   - El auto-scale de realCubeDimensions se añadió porque el cubo real no es
-//     perfectamente cúbico y la rotación del gemelo digital no coincidía.
-//   - El sticker face-check se desactivó (comentado) porque funciona bien sin él.
-
 using UnityEngine;
 using System;
 
 public class FusionTracker : MonoBehaviour
 {
+    // Tracker multimodal de un objeto fisico. Combina IMU/FSR por BLE,
+    // posicion visual, mano activa y reglas de forma.
+    // Entrada principal: BLEManager aporta rotacion/FSR, ObjectDetectionVisualizerV2 aporta posiciones,
+    // y LateUpdate decide la pose final del objeto visible.
+    //
+    // Relacion con otros scripts:
+    // - FusionSystemManager asocia detecciones YOLO a este tracker y llama a NotifyYoloDetection,
+    //   ApplyKeypointCalibration y UpdateVisualPosition.
+    // - CubeContactAssessor resume FSR/IMU/mano en niveles de contacto.
+    // - ShapePolicy define geometria: keypoints, apoyo sobre mesa y snapping de rotacion.
+    // - MemoryGame puede fijar tableWorldHeightY/lockToTable para alinear juego y fusion.
+    //
+    // Nota para quien empieza con Unity/C#:
+    // - Los campos public o [SerializeField] aparecen en el Inspector y se configuran en prefabs/escenas.
+    // - Los campos private con guion bajo son memoria interna de esta instancia durante la partida.
+    // - Vector3 representa posicion/direccion 3D; Quaternion representa rotacion.
+    // --- Configuracion visible en Inspector ---
+    // Identidad logica del objeto: el manager usa estos datos para asociar BLE, color visual y prefab.
     [Header("Identity")]
-    public bool visionOnlyMode = false;
     public string assignedName;
     public DetectedColor myColorIdentity;
 
+    // Politica de forma: encapsula lo que cambia entre cubo, taza u otro objeto fisico.
+    // Asi FusionTracker no necesita conocer detalles geometricos especificos de cada pieza.
+    [Header("Shape")]
+    public ShapePolicy shape;
+
+    // Referencias de escena que el tracker necesita para mover el objeto visible y leer mano/cabeza.
     [Header("References")]
     public Transform visualObject;
-    // Mano activa para tracking de grip. Se asigna desde FusionSystemManager
-    // según la elección del paciente en la calibración (puede ser derecha o izquierda).
     public OVRHand trackingHand;
     public Transform playerHead;
-    public SurfaceSnapper surfaceSnapper;
 
-    [Header("Real Cube Dimensions (metres)")]
-    [Tooltip("Exact dimensions of the physical cube in metres.\n" +
-             "Measure with a ruler/caliper. X=width, Y=height, Z=depth.\n" +
-             "Example: 3.0cm × 3.0cm × 3.5cm → (0.030, 0.030, 0.035)\n" +
-             "Set to (0,0,0) to skip auto-scaling.")]
-    public Vector3 realCubeDimensions = Vector3.zero;
+    // Bloqueo a mesa: fuerza la altura Y cuando el objeto esta apoyado para evitar temblores de profundidad.
+    // La altura puede venir de MRUK, MemoryGame o una correccion manual/automatica.
+    [Header("Table Lock")]
+    public bool lockToTable = false;
+    public float tableWorldHeightY = 0.0f;
+    [Tooltip("Correccion manual de errores de mesa en metros. Positivo sube el objeto, negativo lo baja.")]
+    public float tableHeightCorrection = 0.0f;
+    [Tooltip("Correccion automatica estimada desde muestras visuales estables al inicio de la sesion.")]
+    public float autoTableHeightCorrection = 0.0f;
+    [Tooltip("Desviacion visual maxima en Y que aun se trata como contacto con mesa.")]
+    public float snapThreshold = 0.06f;
 
+    // Suavizado de posicion y pequenos umbrales para ignorar ruido visual o rotacional.
     [Header("Movement Control")]
     public float visualCorrectionSpeed = 12.0f;
-    public Vector3 inferenceViewOffset = new Vector3(-0.032f, 0f, 0f);
     public float angularDeadzoneDeg = 1.5f;
-
-    [Tooltip("Vertical offset applied to the depth-map position (metres).\n" +
-             "Depth map hits the top face; pivot is at the base → set to -halfHeight.")]
-    public float depthYOffset = -0.015f;
-
-    [Tooltip("Minimum distance (metres) the new detection must differ from\n" +
-             "the current target to accept the update. Filters depth-map jitter.\n" +
-             "0.005 = 5mm. Increase if the cube still jitters.")]
     public float positionDeadzoneMeters = 0.005f;
 
+    // Parametros de rotacion/calibracion: deciden cuando confiar en keypoints y como mezclar sensor + vision.
     [Header("Rotation & Stability")]
     public float rotationSmoothSpeed = 30.0f;
     public float calibrationLerpSpeed = 8.0f;
     public float stabilityAngleThreshold = 3.0f;
     public float keypointCalibrationDeadzoneDeg = 0f;
     public float instantCorrectionThresholdDeg = 15.0f;
-    public float rotationDeadzone = 0.1f;
-
-    [Tooltip("Minimum seconds between ongoing recalibrations.")]
     public float recalibCooldownSeconds = 2.0f;
-
-    [Tooltip("When ON: ongoing recalibration requires 4 keypoints + geometric check.")]
     public bool requireHighConfidenceForRecalib = true;
 
-    // ── Umbrales de estabilidad ──────────────────────────────────────
-    // Antes: stabilityRequiredFrames = 40 → a ~1-2 Hz de detección = 20-40s de espera.
-    // Ahora: relajado a 8 frames, mucho más alcanzable en Quest.
-    [Header("Stability (relaxed for Quest detection rates)")]
+    // Contadores de estabilidad: cuantos frames seguidos debe repetirse una condicion antes de aceptarla.
+    [Header("Stability")]
     public int stabilityRequiredFrames = 8;
     public int initialStabilityRequiredFrames = 3;
 
-    // ── Filtro temporal ──────────────────────────────────────────────
-    // Antes: medianFilterSize=5, maxBufferSpreadDeg=12.
-    // Ahora: buffer más pequeño, tolerancia de spread más amplia.
-    [Header("Temporal Filter (relaxed)")]
+    // Estabilidad de cabeza: si el usuario mueve mucho la cabeza, la proyeccion visual puede ser menos fiable.
+    [Header("Head Stability")]
+    public int headStableRequiredFrames = 3;
+    public float headStableThresholdDeg = 1.5f;
+
+    // Filtro temporal de offsets: evita recalibrar con una sola deteccion aislada o erronea.
+    [Header("Temporal Filter")]
     public int medianFilterSize = 3;
     public float maxBufferSpreadDeg = 20.0f;
 
+    // Limite amplio para la primera alineacion sensor-vision.
     [Header("Initial Calibration")]
     public float initialCalibrationMaxOffset = 180f;
 
+    // Orientacion fisica del sensor respecto al objeto. Compensa como esta montada la electronica.
     [Header("Physical Mounting")]
     public Vector3 mountingRotation = Vector3.zero;
 
-    // ── Calibración con simetría ─────────────────────────────────────
-    // Portado del branch de QR. El snap de 90° está desactivado para keypoints
-    // porque bloqueaba las correcciones (ver nota en ApplyKeypointCalibration).
-    [Header("Symmetry-Aware Calibration")]
-    [Tooltip("Enable 90° snap for cube symmetry, like the QR branch does.")]
-    public bool useSymmetrySnap = true;
-
-    // ── Estimación de bias del giroscopio ────────────────────────────
-    // Los IMUs 6-ejes (sin magnetómetro) derivan en yaw con el tiempo.
-    // Esto mide cuánto drift hay cuando el cubo está quieto y lo compensa.
-    // Desactivado por defecto, activar si se nota drift acumulado en reposo.
-    [Header("Gyro Bias Estimation")]
-    [Tooltip("Enable automatic yaw bias estimation during rest periods.")]
-    public bool enableBiasEstimation = false;
-    [Tooltip("Seconds of stability required before bias estimation starts.")]
-    public float biasEstimationDelay = 1.5f;
-    [Tooltip("How fast the bias estimate converges (lower = slower, more stable).")]
-    public float biasLearningRate = 0.02f;
-
+    // Visuales auxiliares de keypoints. Solo ayudan a depurar calibracion; no afectan al gameplay.
     [Header("Debug Keypoints")]
-    [Tooltip("Show keypoint spheres and direction arrows on Quest.")]
-    public bool showKeypointDebug = true;
-    public float keypointSphereRadius = 0.004f;
-    public bool verboseCalibrationLog = true;
+    [SerializeField] private bool showKeypointDebug = true;
+    [SerializeField] private float keypointSphereRadius = 0.004f;
 
-    [Header("Experimentation")]
-    public Transform groundTruthTransform;
-    public event Action<Vector3, Vector3, double> OnVisualDetection;
-    public event Action<double> OnGripStarted;
-    public event Action<double> OnGripEnded;
+    // Evento usado por el logger ligero de calibracion.
     public event Action<float, double> OnCalibrationErrorMeasured;
-    private bool _expEnabled = false;
-    public void SetExperimentation(bool en) => _expEnabled = en;
 
+    // Umbrales FSR: entrada y salida separados para que el agarre no parpadee cerca del limite.
     [Header("Grip Detection")]
     public int gripThresholdEnter = 20;
     public int gripThresholdExit = 10;
     public float grabCooldown = 0.5f;
 
-    // ── Estado privado ───────────────────────────────────────────────
+    // Evaluador de contacto: resume senales de FSR, IMU y vision en una lectura simple de apoyo/manipulacion.
+    [Header("Contact Assessment")]
+    public CubeContactAssessor contactAssessor = new CubeContactAssessor();
 
+    // Magnitud minima de movimiento lineal IMU para considerar que el objeto se esta desplazando.
+    [Header("IMU Linear Motion")]
+    public float imuLinearMotionThreshold = 0.18f;
+
+    // Puente IMU-mano durante oclusion: mantiene el objeto pegado a la mano si la vision se pierde,
+    // pero solo cuando IMU, proximidad y contacto hacen probable que el paciente lo este manipulando.
+    [Header("IMU Occlusion Hand Bridge")]
+    public bool enableImuOcclusionHandBridge = true;
+    public float occlusionBridgeEntryRadius = 0.045f;
+    public float occlusionBridgeContactSlack = 0.02f;
+    public float occlusionBridgeMaxSeconds = 3.0f;
+    public float occlusionBridgeMaxActiveSeconds = 6.0f;
+    public float occlusionBridgeTableCoverRadius = 0.14f;
+    public float occlusionBridgeCoverMemorySeconds = 0.45f;
+    public float occlusionBridgeEntryLinearMotionThreshold = 0.6f;
+    public float occlusionBridgeReleaseLinearMotionThreshold = 0.1f;
+    public int occlusionBridgeReleaseRestFrames = 2;
+    public float occlusionBridgeReentryCooldownSeconds = 0.35f;
+    public float occlusionBridgeCandidateSwitchMargin = 0.03f;
+    public int occlusionBridgeEntryFrames = 2;
+    public int occlusionBridgeExitFrames = 4;
+
+    // Logger diagnostico separado para inspeccionar por que el puente IMU-mano entra o se bloquea.
+    [Header("Debug IMU Motion")]
+    [SerializeField] private FusionImuMotionDebugLogger imuMotionDebug = new FusionImuMotionDebugLogger();
+
+    // --- Estado interno: agarre, oclusion y evidencia BLE reciente ---
+    // No se configura en Inspector: Unity lo recalcula durante la partida.
+    // FSR representa agarre confirmado; el puente IMU cubre oclusiones cuando hay movimiento
+    // de sensor pero la vision deja de ver bien el objeto.
     private bool _isGripping;
+    private bool _isOcclusionBridgeActive;
+    private int _occlusionBridgeEntryCount;
+    private int _occlusionBridgeExitCount;
+    private int _occlusionBridgeRestExitCount;
+    private Vector3 _occlusionBridgeLocalPosition;
+    private float _occlusionBridgeStartTime;
+    private float _lastOcclusionBridgeCoverTime = -10f;
+    private float _lastOcclusionBridgeStopTime = -10f;
+    private bool _hasAcceptedVisualPosition;
+    private int _lastImuPayloadLength;
+    private bool _lastImuHasLinearMotion;
+    private float _lastReadImuLinearMotion;
+
+    // Lectura publica corta para otros scripts: ultimo movimiento lineal decodificado desde IMU.
+    public float LastLinearMotion => _lastReadImuLinearMotion;
+
+    // --- Estado interno: ultimo frame visual y relacion con fisicas/mano ---
+    // Guarda la ultima posicion YOLO, si hubo deteccion este frame y datos necesarios para seguir la mano.
+    private Vector3 _lastYoloPosition;
+    private bool _hasYoloThisFrame;
     private float _lastReleaseTime;
     private Rigidbody _rb;
-
-    // Posición del cubo en espacio local de la mano cuando se agarra.
-    // Se usa para mover el cubo con la mano durante el grip.
     private Vector3 _gripLocalPosition;
 
-    // Offset de calibración: la rotación que hay que aplicar al IMU raw para
-    // que coincida con lo que ve la cámara. Se calcula a partir de los keypoints.
+    // --- Estado interno: calibracion sensor-vision ---
+    // La calibracion no cambia el dato BLE bruto; guarda un offset de yaw que alinea sensor y keypoints.
     private Quaternion _calibrationOffset = Quaternion.identity;
-
-    // Target hacia el que interpola _calibrationOffset (para transiciones suaves)
     private Quaternion _targetCalibrationOffset = Quaternion.identity;
 
-    // Posición 3D objetivo del cubo, viene de YOLO + depth map
+    // --- Estado interno: pose objetivo y estabilidad ---
+    // _visualTargetPosition es el ancla de posicion que llega de YOLO/profundidad y se suaviza al aplicar.
+    // _smoothedRotation es la rotacion final filtrada que vera el usuario en escena.
     private Vector3 _visualTargetPosition;
-
-    // Última rotación válida leída del IMU
     private Quaternion _lastValidSensorRotation;
-
-    // Rotación suavizada que se aplica al visualObject (evita saltos)
     private Quaternion _smoothedRotation;
-
-    // Contador de frames consecutivos en los que el IMU no ha cambiado mucho.
-    // Se usa para el gate de estabilidad antes de calibrar.
     private int _stableFramesCount;
-
-    // Flags de control
     private bool _forceNextVisualUpdate = false;
     private bool _hasInitialCalibration = false;
 
-    // ── Buffer del filtro temporal (mediana) ─────────────────────────
-    // Se van acumulando offsets de yaw. Cuando hay suficientes muestras
-    // y son consistentes (spread bajo), se aplica la mediana como corrección.
+    // Buffer circular pequeno para aceptar recalibraciones solo si varias mediciones visuales coinciden.
+    // Si los offsets se dispersan demasiado, se descarta para evitar saltos de orientacion.
     private float[] _offsetBuffer;
     private int _offsetWriteIdx;
     private int _offsetCount;
     private bool _wasStable;
     private float _lastRecalibTime;
-
-    // Flag que se activa al soltar el cubo: esperamos una detección de alta
-    // confianza para recalibrar. Si no llega en 5s, timeout.
     private bool _pendingPostReleaseCalib;
 
-    // ── Estado del bias del giroscopio ────────────────────────────────
-    private float _yawBiasEstimate = 0f;       // bias acumulado en deg/s
-    private float _stableRestTime = 0f;         // segundos estable y sin grip
-    private Quaternion _biasReferenceRot;       // rotación al empezar el reposo
-    private bool _biasReferenceSet = false;
+    // Estabilidad de cabeza calculada frame a frame. Protege calibraciones mientras cambia la vista del usuario.
+    private Quaternion _lastHeadRotation;
+    private int _headStableFrames;
 
-    // ── Visualización de debug (generado con IA generativa) ────────
-    // 4 esferitas (una por keypoint) + 2 flechas (visión vs IMU)
-    private GameObject[] _kpSpheres;
-    private LineRenderer _arrowVisual;   // verde: dirección según keypoints
-    private LineRenderer _arrowSensor;   // cyan: dirección según IMU
-    private static readonly Color[] KP_COLORS = { Color.red, Color.green, Color.blue, Color.yellow };
+    // Cache de orientacion y visuales auxiliares para no recrear objetos ni recalcular ejes innecesariamente.
+    private Vector3 _cachedDownAxis = Vector3.down;
+    private FusionKeypointDebugVisualizer _keypointDebug;
 
-    // ── Propiedades públicas ─────────────────────────────────────────
+    // Ultima pose enviada a logs de experimento. Permite derivar velocidades y evitar filas ambiguas.
+    private Vector3 _lastLoggedPosition;
+    private Quaternion _lastLoggedRotation = Quaternion.identity;
+    private bool _hasLastLoggedPose;
 
+    // Lista estatica = compartida por todos los FusionTracker activos.
+    // Se usa solo para decidir que objeto tiene permiso de seguir la mano en una oclusion.
+    private static readonly System.Collections.Generic.List<FusionTracker> ActiveTrackers = new();
+    private static FusionTracker _occlusionBridgeOwner;
+
+    // --- Estado publico de solo lectura ---
+    // Propiedades con "=>" son accesos cortos: calculan o devuelven un valor sin permitir modificarlo desde fuera.
     public bool IsStable => _stableFramesCount >= stabilityRequiredFrames;
     public bool IsStableForInitial => _stableFramesCount >= initialStabilityRequiredFrames;
+    public bool IsHeadStable => _headStableFrames >= headStableRequiredFrames;
     public bool HasInitialCalibration => _hasInitialCalibration;
     public float LastVisualUpdateTime { get; private set; }
-    public double LastDetectionTime { get; private set; }
-    public Quaternion HybridRotation => visualObject != null ? visualObject.rotation : transform.rotation;
-    public Quaternion WristRotation => trackingHand != null ? trackingHand.transform.rotation : Quaternion.identity;
     public bool IsGripping => _isGripping;
-    public float YawBiasEstimate => _yawBiasEstimate;
+    public ContactLevel CurrentContactLevel => contactAssessor.Level;
 
-    // ══════════════════════════════════════════════════════════════════
-    //  Lifecycle
-    // ══════════════════════════════════════════════════════════════════
+    // Datos internos expuestos solo a helpers de depuracion. La logica principal no debe depender de ellos.
+    internal bool HasAcceptedVisualPositionForDebug => _hasAcceptedVisualPosition;
+    internal bool IsOcclusionBridgeActiveForDebug => _isOcclusionBridgeActive;
+    internal int LastImuPayloadLengthForDebug => _lastImuPayloadLength;
+    internal bool LastImuHasLinearMotionForDebug => _lastImuHasLinearMotion;
+    internal float LastOcclusionBridgeStopTimeForDebug => _lastOcclusionBridgeStopTime;
+    internal int OcclusionBridgeEntryCountForDebug => _occlusionBridgeEntryCount;
+    internal static FusionTracker OcclusionBridgeOwnerForDebug => _occlusionBridgeOwner;
+    internal bool ShowKeypointDebug => showKeypointDebug;
+    internal Vector3 VisualTargetPosition => _visualTargetPosition;
+    internal FusionKeypointDebugVisualizer KeypointDebug
+    {
+        get
+        {
+            if (_keypointDebug == null) InitDebugVisuals();
+            return _keypointDebug;
+        }
+    }
+
+    public void NotifyYoloDetection(Vector3 yoloWorldPos)
+    {
+        // Guarda la ultima posicion YOLO para clasificar contacto y oclusion en LateUpdate.
+        // No mueve el objeto: solo actualiza evidencia visual para el evaluador de contacto.
+        _lastYoloPosition = yoloWorldPos;
+        _hasYoloThisFrame = true;
+    }
 
     private void Awake()
     {
-        // Si no se asignó visualObject en Inspector, usamos nuestro propio transform
+        // Awake lo llama Unity una vez al crear el componente, antes del primer frame.
+        // Aqui se preparan referencias, escala real y buffers antes de recibir datos BLE o vision.
         if (visualObject == null) visualObject = transform;
         _rb = GetComponent<Rigidbody>();
         _visualTargetPosition = transform.position;
         _lastValidSensorRotation = _smoothedRotation = transform.rotation;
 
-        // Buscar la cámara principal como referencia de la cabeza del jugador
         if (playerHead == null && Camera.main != null) playerHead = Camera.main.transform;
+        _lastHeadRotation = playerHead != null ? playerHead.rotation : Quaternion.identity;
 
-        // Intentar encontrar SurfaceSnapper en nosotros mismos o en hijos
-        if (surfaceSnapper == null) surfaceSnapper = GetComponent<SurfaceSnapper>();
-        if (surfaceSnapper == null) surfaceSnapper = GetComponentInChildren<SurfaceSnapper>();
-
-        // ── Auto-escalar el visual para que coincida con el cubo real ──
-        // Añadido porque el cubo real no es perfectamente cúbico (ej: 3x3x3.5cm)
-        // y al rotar se notaba que el gemelo digital no coincidía.
-        if (realCubeDimensions.x > 0f && realCubeDimensions.y > 0f && realCubeDimensions.z > 0f)
-        {
-            // Asumimos que la mesh base es un cubo 1×1×1.
-            Renderer rend = visualObject.GetComponentInChildren<Renderer>();
-            if (rend != null)
-            {
-                // Tamaño nativo de la mesh sin escalar
-                Vector3 meshSize = rend.localBounds.size;
-                if (meshSize.x > 0f && meshSize.y > 0f && meshSize.z > 0f)
-                {
-                    Vector3 currentScale = visualObject.localScale;
-
-                    // Tamaño real de la mesh con la escala actual
-                    Vector3 actualMeshSize = Vector3.Scale(meshSize, currentScale);
-
-                    // Calcular la escala necesaria para que la mesh mida exactamente
-                    // lo mismo que el cubo físico real
-                    visualObject.localScale = new Vector3(
-                        currentScale.x * (realCubeDimensions.x / actualMeshSize.x),
-                        currentScale.y * (realCubeDimensions.y / actualMeshSize.y),
-                        currentScale.z * (realCubeDimensions.z / actualMeshSize.z));
-
-                    Debug.Log($"[FT:{myColorIdentity}] Scaled visual to match real cube: " +
-                              $"{realCubeDimensions.x * 100:F1}×{realCubeDimensions.y * 100:F1}×{realCubeDimensions.z * 100:F1}cm " +
-                              $"(scale={visualObject.localScale})");
-                }
-            }
-
-        }
+        if (shape != null) shape.ApplyRealDimensionScaling(visualObject);
 
         _forceNextVisualUpdate = true;
-
-        // Inicializar el buffer del filtro de mediana con el tamaño configurado (mínimo 3)
         _offsetBuffer = new float[Mathf.Max(3, medianFilterSize)];
         InitDebugVisuals();
     }
 
-    private void OnDestroy() { DestroyDebugVisuals(); }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  Visualización de debug (generado con IA generativa)
-    // ══════════════════════════════════════════════════════════════════
-
-    // Crea 4 esferitas de colores (una por keypoint) y 2 flechas (visión e IMU)
-    // para poder depurar visualmente en Quest.
-    private void InitDebugVisuals()
+    private void OnEnable()
     {
-        _kpSpheres = new GameObject[4];
-        for (int i = 0; i < 4; i++)
-        {
-            _kpSpheres[i] = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            _kpSpheres[i].name = $"KP_{myColorIdentity}_{i}";
-            _kpSpheres[i].transform.localScale = Vector3.one * keypointSphereRadius * 2f;
-
-            // Quitar el collider para que no interfiera con la física
-            var col = _kpSpheres[i].GetComponent<Collider>();
-            if (col) Destroy(col);
-
-            // Material unlit para que se vea sin importar la iluminación
-            var r = _kpSpheres[i].GetComponent<Renderer>();
-            if (r) { r.material = new Material(Shader.Find("Unlit/Color")); r.material.color = KP_COLORS[i]; }
-            _kpSpheres[i].SetActive(false);
-        }
-
-        // Flecha verde = dirección según keypoints (visión)
-        // Flecha cyan = dirección según IMU (sensor)
-        _arrowVisual = MakeArrow($"Arrow_Visual_{myColorIdentity}", Color.green);
-        _arrowSensor = MakeArrow($"Arrow_Sensor_{myColorIdentity}", Color.cyan);
+        // Registro global usado para repartir propiedad del puente de oclusion entre trackers.
+        if (!ActiveTrackers.Contains(this))
+            ActiveTrackers.Add(this);
     }
 
-    // Crea un LineRenderer con forma de flecha (ancho decreciente)
-    private LineRenderer MakeArrow(string name, Color c)
+    private void OnDisable()
     {
-        var go = new GameObject(name);
-        var lr = go.AddComponent<LineRenderer>();
-        lr.positionCount = 2;
-        lr.startWidth = 0.003f;
-        lr.endWidth = 0.001f;
-        lr.material = new Material(Shader.Find("Unlit/Color"));
-        lr.material.color = c;
-        lr.useWorldSpace = true;
-        go.SetActive(false);
-        return lr;
+        // Libera registro y propiedad si este tracker se desactiva.
+        ActiveTrackers.Remove(this);
+        if (_occlusionBridgeOwner == this)
+            _occlusionBridgeOwner = null;
+    }
+
+    // Destruye visuales de depuracion creados en runtime.
+    private void OnDestroy() { DestroyDebugVisuals(); }
+
+    private void InitDebugVisuals()
+    {
+        // Crea esferas de keypoints y flechas de direccion para inspeccionar calibracion.
+        if (_keypointDebug == null) _keypointDebug = new FusionKeypointDebugVisualizer();
+        _keypointDebug.Initialize(shape, myColorIdentity, keypointSphereRadius);
     }
 
     private void DestroyDebugVisuals()
     {
-        if (_kpSpheres != null)
-            foreach (var s in _kpSpheres) if (s) Destroy(s);
-        if (_arrowVisual) Destroy(_arrowVisual.gameObject);
-        if (_arrowSensor) Destroy(_arrowSensor.gameObject);
+        // Limpia objetos auxiliares para no dejarlos vivos al cambiar de escena.
+        _keypointDebug?.DestroyVisuals();
+        _keypointDebug = null;
     }
 
-    // Actualiza las esferitas de debug en la posición de los keypoints
-    // y las flechas de dirección (verde=visión, cyan=IMU).
-    // Llamado desde FusionSystemManager en cada detección de CuboSensor.
-    public void UpdateKeypointDebug(Vector3[] kptsWorld, bool[] kptsValid,
-                                     Quaternion sensorRotation)
+    public void ApplyKeypointCalibration(Vector3[] kptsWorld, bool[] kptsValid, Quaternion sensorRotation, bool isGeometricValid)
     {
-        // Contar keypoints válidos para decidir si mostramos flechas
-        int validCount = 0;
-        if (kptsValid != null)
-            for (int i = 0; i < kptsValid.Length; i++)
-                if (kptsValid[i]) validCount++;
-
-        // Mostrar/ocultar cada esferita según si su keypoint es válido
-        for (int i = 0; i < 4; i++)
-        {
-            bool vis = showKeypointDebug && kptsValid != null
-                     && i < kptsValid.Length && kptsValid[i];
-            _kpSpheres[i].SetActive(vis);
-            if (vis) _kpSpheres[i].transform.position = kptsWorld[i];
-        }
-
-        // Con menos de 3 keypoints no podemos calcular dirección fiable
-        if (!showKeypointDebug || validCount < 3)
-        {
-            if (_arrowVisual) _arrowVisual.gameObject.SetActive(false);
-            if (_arrowSensor) _arrowSensor.gameObject.SetActive(false);
-            return;
-        }
-
-        // Calcular la dirección frontal de la cara del sticker (solo XZ, sin Y)
-        Vector3 faceDir = ComputeFaceDirectionXZ(kptsWorld, kptsValid);
-        Vector3 center = ComputeValidCenter(kptsWorld, kptsValid);
-
-        // Dirección frontal del IMU proyectada al plano horizontal
-        Vector3 sensorFwd = sensorRotation * Vector3.forward;
-        sensorFwd.y = 0;
-
-        float arrowLen = 0.07f;
-
-        // Flecha verde: hacia donde apuntan los keypoints
-        if (_arrowVisual)
-        {
-            bool valid = faceDir.sqrMagnitude > 0.001f;
-            _arrowVisual.gameObject.SetActive(valid);
-            if (valid)
-            {
-                _arrowVisual.SetPosition(0, center);
-                _arrowVisual.SetPosition(1, center + faceDir.normalized * arrowLen);
-            }
-        }
-
-        // Flecha cyan: hacia donde apunta el IMU (ligeramente elevada para que no se solape)
-        if (_arrowSensor)
-        {
-            bool valid = sensorFwd.sqrMagnitude > 0.001f;
-            _arrowSensor.gameObject.SetActive(valid);
-            if (valid)
-            {
-                Vector3 off = Vector3.up * 0.005f;
-                _arrowSensor.SetPosition(0, center + off);
-                _arrowSensor.SetPosition(1, center + off + sensorFwd.normalized * arrowLen);
-            }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  Dirección frontal desde keypoints
-    // ══════════════════════════════════════════════════════════════════
-
-    // Calcula la dirección "forward" de la cara del sticker en el plano XZ (solo yaw).
-    //
-    // Layout de los keypoints en la cara del sticker:
-    //   KP0: Arriba-Derecha    KP1: Arriba-Izquierda
-    //   KP3: Abajo-Derecha     KP2: Abajo-Izquierda
-    //
-    // Método: promedio del vector izquierdo (KP2→KP1) y derecho (KP3→KP0).
-    // Todos aplanados a Y=0 porque solo nos interesa el yaw.
-    // Devuelve zero si hay menos de 3 keypoints válidos.
-    private Vector3 ComputeFaceDirectionXZ(Vector3[] kpts, bool[] valid)
-    {
-        int validCount = 0;
-        for (int i = 0; i < 4; i++)
-            if (valid != null && i < valid.Length && valid[i]) validCount++;
-
-        if (validCount < 3) return Vector3.zero;
-
-        // Aplanar todos los puntos a Y=0 (solo queremos yaw)
-        Vector3[] flat = new Vector3[4];
-        for (int i = 0; i < 4; i++)
-            flat[i] = new Vector3(kpts[i].x, 0f, kpts[i].z);
-
-        Vector3 forwardDir = Vector3.zero;
-
-        // Lado izquierdo: de abajo-izquierda a arriba-izquierda
-        if (valid[2] && valid[1])
-            forwardDir += (flat[1] - flat[2]);
-
-        // Lado derecho: de abajo-derecha a arriba-derecha
-        if (valid[3] && valid[0])
-            forwardDir += (flat[0] - flat[3]);
-
-        // Promediando ambos lados nos da la dirección frontal.
-        // Nota: se eliminó el chequeo con Vector3.Dot y toCamera que
-        // volteaba el cubo en algunos casos.
-
-        return forwardDir.sqrMagnitude > 0.0001f ? forwardDir.normalized : Vector3.zero;
-    }
-
-    // Overload de compatibilidad: asume los 4 keypoints válidos
-    private Vector3 ComputeFaceDirectionXZ(Vector3[] kpts)
-    {
-        bool[] allValid = { true, true, true, true };
-        return ComputeFaceDirectionXZ(kpts, allValid);
-    }
-
-    // Centroide de solo los keypoints válidos
-    private static Vector3 ComputeValidCenter(Vector3[] kpts, bool[] valid)
-    {
-        Vector3 sum = Vector3.zero;
-        int count = 0;
-        for (int i = 0; i < 4; i++)
-        {
-            if (valid != null && i < valid.Length && valid[i])
-            {
-                sum += kpts[i];
-                count++;
-            }
-        }
-        return count > 0 ? sum / count : Vector3.zero;
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  Calibración por keypoints (3 caminos: initial, post-release, ongoing)
-    // ══════════════════════════════════════════════════════════════════
-
-    // Punto de entrada principal para calibrar el yaw.
-    // Requiere 3+ keypoints válidos y datos activos del IMU.
-    //
-    // Los tres caminos se fueron añadiendo según las necesidades:
-    //   PATH 1 (initial): el primero que se implementó, calibración inmediata.
-    //   PATH 3 (ongoing): se añadió después para corregir drift acumulado.
-    //   PATH 2 (post-release): se añadió al final porque al soltar el cubo
-    //     tras girarlo, el offset cambiaba y necesitaba recalibrarse rápido.
-    public void ApplyKeypointCalibration(Vector3[] kptsWorld, bool[] kptsValid,
-                                          Quaternion sensorRotation,
-                                          bool isGeometricValid, int validKeypointCount)
-    {
-        // No calibrar mientras el usuario tiene el cubo en la mano
+        // Corrige yaw del sensor cuando la vision ofrece keypoints estables y geometricamente fiables.
+        // Orden de rechazo intencional: primero evita calibrar durante agarre, luego exige forma,
+        // estabilidad del objeto y estabilidad de cabeza antes de tocar offsets.
+        // Este metodo solo modifica offsets de rotacion; la aplicacion real ocurre despues en LateUpdate.
+        // Estas primeras salidas son filtros de seguridad: si una condicion no se cumple, no se calibra.
         if (_isGripping) return;
+        if (shape == null || !shape.CanCalibrateYaw(kptsValid)) return;
+        if (!_hasInitialCalibration) { if (!IsStableForInitial) return; } else { if (!IsStable) return; }
+        if (!IsHeadStable) return;
 
-        // Gate mínimo: necesitamos al menos 3 keypoints
-        if (validKeypointCount < 3)
-        {
-            if (verboseCalibrationLog && Time.frameCount % 60 == 0)
-                Debug.Log($"[FT:{myColorIdentity}] GATE: validKPs={validKeypointCount} < 3");
-            return;
-        }
+        // Compara la direccion frontal visual con la direccion frontal del sensor.
+        // Si ambas no apuntan igual, la diferencia es el "offset" que corrige el yaw del IMU.
+        Vector3 faceDir = shape.ComputeForwardXZ(kptsWorld, kptsValid, _visualTargetPosition);
+        if (faceDir == Vector3.zero) return;
 
-        // ── Sticker face-check (desactivado) ─────────────────────────
-        // Comprobaba si el sticker estaba de lado mirando la distancia de la
-        // fila superior vs inferior al jugador. Funciona bien sin él ahora,
-        // así que se dejó comentado.
-        if (playerHead != null)
-        {
-            float topDist = 0f;   // KP0 + KP1 (fila superior)
-            int topCount = 0;
-            float botDist = 0f;   // KP2 + KP3 (fila inferior)
-            int botCount = 0;
-
-            for (int i = 0; i < 4; i++)
-            {
-                if (!kptsValid[i]) continue;
-                float d = Vector3.Distance(playerHead.position, kptsWorld[i]);
-                if (i <= 1) { topDist += d; topCount++; }
-                else { botDist += d; botCount++; }
-            }
-
-            if (topCount > 0 && botCount > 0)
-            {
-                float avgTop = topDist / topCount;
-                float avgBot = botDist / botCount;
-                // Si la fila inferior está más lejos, el sticker está de lado.
-                // Desactivado porque ahora no hace falta.
-                /*
-                if (avgBot > avgTop + 0.015f) // 1.5cm tolerancia
-                {
-                    if (verboseCalibrationLog)
-                        Debug.Log($"[FT:{myColorIdentity}] GATE: sticker sideways " +
-                                  $"(top={avgTop:F3} bot={avgBot:F3})");
-                    return;
-                }
-                */
-            }
-        }
-
-        // ── Gate de estabilidad ──────────────────────────────────────
-        // No calibrar si el IMU se está moviendo mucho (el cubo no está quieto).
-        // Para la calibración inicial pedimos menos frames de estabilidad
-        // porque queremos que el cubo "arranque" rápido.
-        if (!_hasInitialCalibration)
-        {
-            if (!IsStableForInitial)
-            {
-                if (verboseCalibrationLog && Time.frameCount % 60 == 0)
-                    Debug.Log($"[FT:{myColorIdentity}] GATE: waiting initial stability " +
-                              $"{_stableFramesCount}/{initialStabilityRequiredFrames}");
-                return;
-            }
-        }
-        else
-        {
-            if (!IsStable)
-            {
-                if (verboseCalibrationLog && Time.frameCount % 60 == 0)
-                    Debug.Log($"[FT:{myColorIdentity}] GATE: waiting stability " +
-                              $"{_stableFramesCount}/{stabilityRequiredFrames}");
-                return;
-            }
-        }
-
-        // ── Calcular el offset de yaw ────────────────────────────────
-        // Comparamos hacia dónde apuntan los keypoints (visión) vs hacia dónde
-        // apunta el IMU (sensor). La diferencia es el error de yaw que hay que corregir.
-        Vector3 faceDir = ComputeFaceDirectionXZ(kptsWorld, kptsValid);
-        if (faceDir == Vector3.zero)
-        {
-            if (verboseCalibrationLog)
-                Debug.Log($"[FT:{myColorIdentity}] GATE: faceDir is zero");
-            return;
-        }
-
-        // Dirección forward del IMU proyectada al plano horizontal
-        Vector3 sensorFwd = sensorRotation * Vector3.forward;
-        sensorFwd.y = 0;
-        if (sensorFwd.sqrMagnitude < 0.0001f)
-        {
-            if (verboseCalibrationLog)
-                Debug.Log($"[FT:{myColorIdentity}] GATE: sensorFwd is zero");
-            return;
-        }
+        Vector3 sensorFwd = sensorRotation * Vector3.forward; sensorFwd.y = 0;
+        if (sensorFwd.sqrMagnitude < 0.0001f) return;
         sensorFwd.Normalize();
 
-        // Convertir ambas direcciones a ángulos de yaw y calcular la diferencia
+        // Atan2 convierte una direccion XZ en angulo horizontal. DeltaAngle evita saltos 359 -> 0 grados.
         float visualYaw = Mathf.Atan2(faceDir.x, faceDir.z) * Mathf.Rad2Deg;
         float sensorYaw = Mathf.Atan2(sensorFwd.x, sensorFwd.z) * Mathf.Rad2Deg;
         float rawOffset = Mathf.DeltaAngle(sensorYaw, visualYaw);
 
-        // Nota: el symmetry snap de 90° (del branch de QR) está DESACTIVADO.
-        // Con QR tenías 4 caras posibles → ambigüedad de 90°. Con keypoints
-        // solo hay una cara (la del sticker), así que rawOffset ES el error real.
-        // El snap redondeaba errores intermedios (ej: 45°) a 0° y bloqueaba
-        // todas las correcciones.
-
-        Debug.Log($"[FT:{myColorIdentity}] PASSED all gates: vYaw={visualYaw:F1} sYaw={sensorYaw:F1} " +
-                  $"raw={rawOffset:F1} " +
-                  $"geo={isGeometricValid} kps={validKeypointCount} " +
-                  $"init={_hasInitialCalibration} stable={_stableFramesCount}");
-
-        // ── PATH 1: CALIBRACIÓN INICIAL ──────────────────────────────
-        // Primera vez que calibramos. Se aplica inmediatamente sin suavizado
-        // porque no hay referencia previa con la que hacer lerp.
         if (!_hasInitialCalibration)
         {
+            // La primera calibracion acepta un offset amplio, pero exige estabilidad.
             if (Mathf.Abs(rawOffset) > initialCalibrationMaxOffset) return;
-
-            // Aplicar directamente: tanto el target como el offset actual
             _targetCalibrationOffset = Quaternion.Euler(0, rawOffset, 0);
             _calibrationOffset = _targetCalibrationOffset;
-            _hasInitialCalibration = true;
-            _pendingPostReleaseCalib = false;
+            _hasInitialCalibration = true; _pendingPostReleaseCalib = false;
+            LogCalibrationEvent("initial_keypoint_yaw", rawOffset);
             ClearOffsetBuffer();
-            if (_expEnabled) OnCalibrationErrorMeasured?.Invoke(Mathf.Abs(rawOffset), ExperimentClock.Now);
-            Debug.Log($"[FT:{myColorIdentity}] ★ INITIAL calib: {rawOffset:F1}° (raw, no snap)");
             return;
         }
 
-        // ── PATH 2: CALIBRACIÓN POST-RELEASE ────────────────────────
-        // Justo después de soltar el cubo, necesitamos recalibrar rápido porque
-        // el usuario puede haberlo girado. Esperamos UNA detección de alta
-        // confianza (4/4 keypoints + validación geométrica) y la aplicamos
-        // inmediatamente. Si no llega en 5s, desistimos.
         if (_pendingPostReleaseCalib)
         {
-            bool highConfidence = validKeypointCount == 4 && isGeometricValid;
-
-            if (highConfidence && Mathf.Abs(rawOffset) < 90f)
+            // Tras soltar el objeto, permite una correccion fuerte si la deteccion es de alta confianza.
+            // Esto recupera el alineamiento despues de manipular el objeto con la mano.
+            if (shape.IsHighConfidence(kptsValid, isGeometricValid) && Mathf.Abs(rawOffset) < 90f)
             {
-                // Aplicar directamente, sin mediana ni suavizado
                 _targetCalibrationOffset = Quaternion.Euler(0, rawOffset, 0);
                 _calibrationOffset = _targetCalibrationOffset;
-                _pendingPostReleaseCalib = false;
-                _lastRecalibTime = Time.time;
+                _pendingPostReleaseCalib = false; _lastRecalibTime = Time.time;
+                LogCalibrationEvent("post_release_keypoint_yaw", rawOffset);
                 ClearOffsetBuffer();
-                Debug.Log($"[FT:{myColorIdentity}] ★ POST-RELEASE calib: {rawOffset:F1}° " +
-                          $"(4kp, geo=true, high confidence)");
                 return;
             }
-
-            // Timeout: si en 5s no llega una buena detección, dejamos de esperar
-            if (Time.time - _lastReleaseTime > 5.0f)
-            {
-                _pendingPostReleaseCalib = false;
-                if (verboseCalibrationLog)
-                    Debug.Log($"[FT:{myColorIdentity}] Post-release calib timeout (no good keypoints in 5s)");
-            }
-
-            // Mientras esperamos post-release, no caemos al ongoing
+            if (Time.time - _lastReleaseTime > 5.0f) _pendingPostReleaseCalib = false;
             return;
         }
 
-        // ── PATH 3: ONGOING (buffer de mediana + cooldown) ───────────
-        // Corrección continua del drift. Se acumulan muestras de offset en un
-        // buffer circular, se calcula la mediana, y si es consistente se aplica.
-        // Cooldown entre recalibraciones para no estar corrigiendo cada frame.
+        if (Time.time - _lastRecalibTime < recalibCooldownSeconds) return;
+        if (requireHighConfidenceForRecalib && !shape.IsHighConfidence(kptsValid, isGeometricValid)) return;
 
-        // Respetar el cooldown entre recalibraciones
-        if (Time.time - _lastRecalibTime < recalibCooldownSeconds)
-            return;
-
-        // Solo muestras de alta confianza entran al buffer de recalibración
-        if (requireHighConfidenceForRecalib && (validKeypointCount < 4 || !isGeometricValid))
-        {
-            if (verboseCalibrationLog && Time.frameCount % 60 == 0)
-                Debug.Log($"[FT:{myColorIdentity}] ONGOING GATE: kps={validKeypointCount} geo={isGeometricValid} — skipped");
-            return;
-        }
-
-        // Escribir la muestra en el buffer circular
+        // En recalibracion continua se filtra por mediana para evitar saltos por keypoints ruidosos.
         _offsetBuffer[_offsetWriteIdx] = rawOffset;
         _offsetWriteIdx = (_offsetWriteIdx + 1) % _offsetBuffer.Length;
         _offsetCount = Mathf.Min(_offsetCount + 1, _offsetBuffer.Length);
 
-        // Esperar a tener suficientes muestras para calcular mediana
+        // No se usa una sola medicion: se espera a tener varias para comparar consistencia.
         int needed = Mathf.Max(3, medianFilterSize);
-        if (_offsetCount < needed)
-        {
-            if (verboseCalibrationLog)
-                Debug.Log($"[FT:{myColorIdentity}] BUFFER: {_offsetCount}/{needed} samples (raw={rawOffset:F1}°)");
-            return;
-        }
+        if (_offsetCount < needed) return;
 
-        // Comprobar que las muestras son consistentes (spread bajo).
-        // Si hay mucho spread, los datos son ruidosos y limpiamos el buffer.
+        // Si las mediciones del buffer estan muy dispersas, probablemente hay ruido visual.
         float minV = float.MaxValue, maxV = float.MinValue;
         for (int i = 0; i < _offsetCount; i++)
         {
             if (_offsetBuffer[i] < minV) minV = _offsetBuffer[i];
             if (_offsetBuffer[i] > maxV) maxV = _offsetBuffer[i];
         }
-        if (maxV - minV > maxBufferSpreadDeg)
-        {
-            Debug.Log($"[FT:{myColorIdentity}] BUFFER: spread {maxV - minV:F1}° > {maxBufferSpreadDeg}° — cleared");
-            ClearOffsetBuffer();
-            return;
-        }
+        if (maxV - minV > maxBufferSpreadDeg) { ClearOffsetBuffer(); return; }
 
-        // Calcular la mediana del buffer
-        float median = ComputeMedian();
-        float absM = Mathf.Abs(median);
+        // La mediana representa el offset "central" y evita que un valor raro domine la correccion.
+        float median = ComputeMedian(); float absM = Mathf.Abs(median);
+        if (absM < keypointCalibrationDeadzoneDeg) { ClearOffsetBuffer(); return; }
 
-        // Si la corrección es menor que la deadzone, no merece la pena aplicarla
-        if (absM < keypointCalibrationDeadzoneDeg)
-        {
-            if (verboseCalibrationLog)
-                Debug.Log($"[FT:{myColorIdentity}] DEADZONE: median={median:F1}° < {keypointCalibrationDeadzoneDeg}°");
-            ClearOffsetBuffer();
-            return;
-        }
-
-        // Aplicar la corrección. Si el error es grande (>15°), instantáneo.
-        // Si es pequeño, se interpola suavemente con lerp en LateUpdate.
         _targetCalibrationOffset = Quaternion.Euler(0, median, 0);
         _lastRecalibTime = Time.time;
-        if (absM >= instantCorrectionThresholdDeg)
-        {
-            _calibrationOffset = _targetCalibrationOffset;
-            Debug.Log($"[FT:{myColorIdentity}] ★ INSTANT recalib: {median:F1}°");
-        }
-        else
-        {
-            Debug.Log($"[FT:{myColorIdentity}] ★ Smooth recalib: {median:F1}°");
-        }
-        if (_expEnabled) OnCalibrationErrorMeasured?.Invoke(absM, ExperimentClock.Now);
+        if (absM >= instantCorrectionThresholdDeg) _calibrationOffset = _targetCalibrationOffset;
+        LogCalibrationEvent("continuous_keypoint_yaw", median);
         ClearOffsetBuffer();
     }
 
-    // Overload de compatibilidad con la firma antigua de 3 parámetros
-    public void ApplyKeypointCalibration(Vector3[] kptsWorld, Quaternion sensorRotation,
-                                          bool isGeometricValid)
+    private void LogCalibrationEvent(string calibrationType, float rawOffset)
     {
-        bool[] allValid = { true, true, true, true };
-        ApplyKeypointCalibration(kptsWorld, allValid, sensorRotation, isGeometricValid, 4);
+        BackgroundDataLogger logger = BackgroundDataLogger.Instance;
+        if (logger != null) logger.LogCalibrationEvent(assignedName, calibrationType, rawOffset);
     }
 
-    // Extrae solo el yaw de un quaternion, eliminando pitch y roll
-    private static Quaternion ForceYawOnly(Quaternion q)
-    {
-        return Quaternion.Euler(0f, q.eulerAngles.y, 0f);
-    }
-
+    // Reinicia el filtro temporal de offsets de yaw.
     private void ClearOffsetBuffer() { _offsetCount = 0; _offsetWriteIdx = 0; }
 
-    // Calcula la mediana del buffer de offsets. Se usa en vez de la media
-    // porque la mediana es más robusta frente a outliers.
     private float ComputeMedian()
     {
-        float[] s = new float[_offsetCount];
-        for (int i = 0; i < _offsetCount; i++) s[i] = _offsetBuffer[i];
-        Array.Sort(s);
-        int m = _offsetCount / 2;
-        return (_offsetCount % 2 == 0) ? (s[m - 1] + s[m]) * 0.5f : s[m];
+        // Mediana simple sobre el buffer actual para rechazar outliers visuales.
+        float[] sortedOffsets = new float[_offsetCount];
+        for (int i = 0; i < _offsetCount; i++) sortedOffsets[i] = _offsetBuffer[i];
+        Array.Sort(sortedOffsets); int middle = _offsetCount / 2;
+        return (_offsetCount % 2 == 0) ? (sortedOffsets[middle - 1] + sortedOffsets[middle]) * 0.5f : sortedOffsets[middle];
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  Estimación de bias del giroscopio
-    // ══════════════════════════════════════════════════════════════════
-
-    // Los IMUs 6-ejes (sin magnetómetro) derivan en yaw con el tiempo.
-    // Cuando el cubo está quieto en la mesa, medimos cuánto drift hay
-    // y acumulamos una estimación con media móvil exponencial (EMA).
-    // Esa estimación se resta cada frame en CompensateBias().
-    //
-    // Desactivado por defecto (enableBiasEstimation = false).
-    private void UpdateBiasEstimation(Quaternion currentRaw)
-    {
-        if (!enableBiasEstimation) return;
-
-        // Solo estimamos bias cuando el cubo está quieto y no se está agarrando
-        bool atRest = !_isGripping && IsStable;
-
-        if (!atRest)
-        {
-            // Se movió o se agarró: resetear el contador de reposo
-            _stableRestTime = 0f;
-            _biasReferenceSet = false;
-            return;
-        }
-
-        _stableRestTime += Time.deltaTime;
-
-        // Guardar la rotación de referencia al empezar el reposo
-        if (!_biasReferenceSet)
-        {
-            _biasReferenceRot = currentRaw;
-            _biasReferenceSet = true;
-            return;
-        }
-
-        // Esperar un poco antes de empezar a estimar (dejar que se estabilice)
-        if (_stableRestTime < biasEstimationDelay) return;
-
-        // Medir cuánto ha derivado el yaw desde la referencia
-        float refYaw = _biasReferenceRot.eulerAngles.y;
-        float curYaw = currentRaw.eulerAngles.y;
-        float yawDrift = Mathf.DeltaAngle(refYaw, curYaw);
-
-        // Calcular tasa de drift (deg/s) en el periodo de reposo
-        float elapsed = _stableRestTime;
-        if (elapsed > 0.1f)
-        {
-            float driftRate = yawDrift / elapsed;
-
-            // EMA: converge lentamente hacia el drift rate real
-            _yawBiasEstimate = Mathf.Lerp(_yawBiasEstimate, driftRate, biasLearningRate);
-
-            if (verboseCalibrationLog && Time.frameCount % 120 == 0)
-                Debug.Log($"[FT:{myColorIdentity}] Bias: drift={yawDrift:F2}° " +
-                          $"rate={driftRate:F3}°/s est={_yawBiasEstimate:F3}°/s");
-        }
-
-        // Renovar la referencia cada 5s para evitar problemas de precisión float
-        if (_stableRestTime > 5f)
-        {
-            _biasReferenceRot = currentRaw;
-            _stableRestTime = biasEstimationDelay; // seguir estimando
-        }
-    }
-
-    // Aplica la compensación de bias a la rotación raw del sensor.
-    // Solo compensa yaw porque es donde derivan los IMUs 6-ejes.
-    private Quaternion CompensateBias(Quaternion rawRot)
-    {
-        if (!enableBiasEstimation || Mathf.Abs(_yawBiasEstimate) < 0.001f)
-            return rawRot;
-
-        // Restar el bias estimado por frame
-        float correction = -_yawBiasEstimate * Time.deltaTime;
-        return Quaternion.Euler(0, correction, 0) * rawRot;
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  Actualización de posición visual
-    // ══════════════════════════════════════════════════════════════════
-
-    // Llamado desde FusionSystemManager con la posición 3D proyectada desde depth map.
-    // Aplica depthYOffset y deadzones de distancia + angular.
-    // Las deadzones se desactivan cuando la mano está cerca (<12cm) o tras soltar el cubo.
     public void UpdateVisualPosition(Vector3 targetPos)
     {
-        LastVisualUpdateTime = Time.time;
-        LastDetectionTime = ExperimentClock.Now;
-        if (_expEnabled) OnVisualDetection?.Invoke(targetPos, transform.localScale, LastDetectionTime);
+        // Acepta una nueva posicion visual y decide si debe mover el objetivo interno.
+        // Importante: aqui no se escribe transform.position. Solo se actualiza _visualTargetPosition,
+        // que ApplyTransform consumira al final del frame.
+        float timeSinceLastUpdate = Time.time - LastVisualUpdateTime;
+        if (timeSinceLastUpdate > 0.5f) _forceNextVisualUpdate = true;
 
-        // No actualizar posición durante grip, la mano manda
+        // LastVisualUpdateTime mide frescura de vision; _hasAcceptedVisualPosition habilita puentes/diagnostico.
+        LastVisualUpdateTime = Time.time;
+        _hasAcceptedVisualPosition = true;
         if (_isGripping) return;
 
-        // El depth map detecta la cara superior del cubo, pero el pivot del objeto
-        // está en la base. Compensamos con depthYOffset (típicamente -halfHeight).
-        targetPos.y += depthYOffset;
+        // Si la cabeza se mueve y el objeto esta estable, se ignora microvision para no perseguir ruido.
+        bool contactBypass = contactAssessor.Level >= ContactLevel.Touching;
+        if (!_forceNextVisualUpdate && !contactBypass && IsStable && !IsHeadStable) return;
 
-        // ── Smart deadzone: se desactiva cuando la mano está cerca ──
-        // Si la mano está acercándose al cubo, queremos que la posición se
-        // actualice rápido para que el agarre sea fluido.
-        bool handNear = false;
-        if (trackingHand != null)
+        Vector3 finalPos = targetPos;
+
+        if (lockToTable)
         {
-            float handDist = Vector3.Distance(
-                trackingHand.transform.position, transform.position);
-            handNear = handDist < 0.12f;
+            // Mientras no haya levantamiento confirmado, fuerza el centro a la altura de mesa.
+            float tableLockedY = GetTableLockedCenterY();
+            bool confirmedLift = contactAssessor.Level >= ContactLevel.HeldSoft && (targetPos.y > tableLockedY + snapThreshold);
+            if (!confirmedLift)
+            {
+                finalPos.y = tableLockedY;
+            }
         }
 
-        // También se bypasea la deadzone justo después de soltar el cubo
-        // (forceNextVisualUpdate) para que se reposicione inmediatamente.
+        bool handNear = trackingHand != null && Vector3.Distance(trackingHand.transform.position, transform.position) < 0.12f;
         bool bypassDeadzone = _forceNextVisualUpdate || handNear;
 
         if (!bypassDeadzone)
         {
-            // Deadzone de distancia: si la nueva posición está muy cerca de la actual,
-            // es ruido del depth map, no movimiento real.
-            if (Vector3.Distance(targetPos, _visualTargetPosition) < positionDeadzoneMeters)
-                return;
-
-            // Deadzone angular: si desde la perspectiva del jugador la posición nueva
-            // está en casi la misma dirección, es jitter lateral del pixel.
-            if (playerHead != null &&
-                Vector3.Angle(targetPos - playerHead.position,
-                              _visualTargetPosition - playerHead.position) < angularDeadzoneDeg)
-                return;
+            // Deadzones evitan microcorrecciones por ruido cuando el objeto y la cabeza estan estables.
+            // Hay una deadzone en metros y otra angular vista desde la cabeza del usuario.
+            if (Vector3.Distance(finalPos, _visualTargetPosition) < positionDeadzoneMeters) return;
+            if (playerHead != null && Vector3.Angle(finalPos - playerHead.position, _visualTargetPosition - playerHead.position) < angularDeadzoneDeg) return;
         }
 
-        _visualTargetPosition = targetPos;
+        _visualTargetPosition = finalPos;
         _forceNextVisualUpdate = false;
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  LateUpdate — Bucle principal de fusión
-    // ══════════════════════════════════════════════════════════════════
+    private float GetTableLockedCenterY()
+    {
+        // Altura final de centro incluyendo correccion automatica.
+        return GetTableLockedCenterYWithoutAutoCorrection() + autoTableHeightCorrection;
+    }
 
-    // Se ejecuta cada frame después de Update.
-    // Aquí es donde se juntan IMU + calibración + grip + posición visual.
+    public float GetTableLockedCenterYWithoutAutoCorrection()
+    {
+        // Altura de centro basada en mesa, offset manual y geometria de la forma.
+        float centerYOffset = shape != null ? shape.GetTableCenterYOffset(visualObject, _cachedDownAxis) : 0f;
+        return tableWorldHeightY + centerYOffset + tableHeightCorrection;
+    }
+
     private void LateUpdate()
     {
-        // Interpolar el offset de calibración hacia el target.
-        // Esto hace que las correcciones pequeñas sean suaves en vez de saltar.
+        // Bucle principal de fusion, ejecutado tras Update para recibir ya las detecciones del frame.
+        // Flujo:
+        // 1) Suaviza offset de calibracion.
+        // 2) Lee BLE y calcula estabilidad del objeto/cabeza.
+        // 3) Actualiza contacto y puente de oclusion.
+        // 4) Resuelve agarre y aplica transform final.
+        // 5) Registra CSV.
         if (Quaternion.Angle(_calibrationOffset, _targetCalibrationOffset) > 0.1f)
-        {
-            _calibrationOffset = Quaternion.Slerp(
-                _calibrationOffset, _targetCalibrationOffset,
-                Time.deltaTime * calibrationLerpSpeed);
-        }
-        else
-        {
-            _calibrationOffset = _targetCalibrationOffset;
-        }
-        // Nota: NO hacemos ForceYawOnly aquí. _calibrationOffset es ahora 3D completo
-        // para preservar qué cara está abajo. SnapDownAxisToWorldDown en ApplyTransform
-        // se encarga de aplanar para cuando está en la mesa.
+            _calibrationOffset = Quaternion.Slerp(_calibrationOffset, _targetCalibrationOffset, Time.deltaTime * calibrationLerpSpeed);
+        else _calibrationOffset = _targetCalibrationOffset;
 
-        // Leer datos del sensor: rotación IMU, estado del FSR (grip/release)
-        ReadSensorData(out Quaternion rawRot, out bool grip, out bool release);
+        // Primero se lee BLE y se convierte en rotacion ya compensada.
+        ReadSensorData(out Quaternion rawRot, out bool grip, out bool release, out int rawFsrValue, out float imuLinearMotion);
 
-        // ── Logging: datos crudos del sensor ──
-        if (_expEnabled)
-        {
-            int rawGrip = 0;
-            DeviceData dd = BLEManager.Instance?.GetDeviceByName(assignedName);
-            if (dd != null) rawGrip = dd.grip;
-            BackgroundDataLogger.Instance?.LogSensorData(myColorIdentity.ToString(), rawRot, rawGrip);
-        }
+        // La estabilidad combina movimiento angular y estado de la cabeza para aceptar calibraciones.
+        float imuDeltaDeg = Quaternion.Angle(rawRot, _lastValidSensorRotation);
+        float contactMotionDeltaDeg = GetContactMotionDeltaDeg(imuDeltaDeg, imuLinearMotion);
+        if (imuDeltaDeg < stabilityAngleThreshold) _stableFramesCount++; else _stableFramesCount = 0;
 
-        // Compensar bias del giroscopio antes de todo lo demás
-        rawRot = CompensateBias(rawRot);
-
-        // Contar frames consecutivos estables (IMU sin cambios grandes).
-        // Esto alimenta el gate de estabilidad para la calibración.
-        if (Quaternion.Angle(rawRot, _lastValidSensorRotation) < stabilityAngleThreshold)
-            _stableFramesCount++;
-        else
-            _stableFramesCount = 0;
-
-        // Usar un umbral de estabilidad más relajado si aún no tenemos calibración inicial
+        // Si el objeto deja de estar estable, se descartan offsets visuales acumulados previamente.
         bool nowStable = _hasInitialCalibration ? IsStable : IsStableForInitial;
-
-        // Si acabamos de dejar de estar estables, limpiar el buffer de mediana
-        // porque las muestras anteriores ya no son de fiar
         if (!nowStable && _wasStable) ClearOffsetBuffer();
         _wasStable = nowStable;
-
         _lastValidSensorRotation = rawRot;
 
-        // Estimación de bias del giroscopio (se ejecuta cada frame, aunque esté desactivada
-        // internamente hace return inmediato si enableBiasEstimation es false)
-        UpdateBiasEstimation(rawRot);
-
-        // Actualizar la máquina de estados del grip (FSR)
-        UpdateGripState(grip, release, rawRot);
-
-        // Aplicar la pose final: calibrationOffset * rawRot = rotación calibrada del cubo
-        ApplyTransform(_calibrationOffset * rawRot);
-
-        // ── Logging: resultado de fusión ──
-        if (_expEnabled)
+        // La cabeza estable importa porque la proyeccion visual depende de la camara del visor.
+        if (playerHead != null)
         {
-            Vector3 downFace = transform.rotation * Vector3.down;
-            BackgroundDataLogger.Instance?.LogFusionData(
-                myColorIdentity.ToString(), transform.position, transform.rotation,
-                _isGripping, downFace);
+            if (Quaternion.Angle(playerHead.rotation, _lastHeadRotation) < headStableThresholdDeg) _headStableFrames++;
+            else _headStableFrames = 0;
+            _lastHeadRotation = playerHead.rotation;
         }
+        else _headStableFrames = headStableRequiredFrames;
+
+        contactAssessor.fsrHardThreshold = gripThresholdEnter;
+        contactAssessor.fsrReleaseThreshold = gripThresholdExit;
+
+        // Se prepara la posicion de mano aunque no haya tracking; el evaluador recibe handTracked=false.
+        Vector3 handPos = trackingHand != null ? trackingHand.transform.position : Vector3.zero;
+        bool handTracked = trackingHand != null && trackingHand.IsTracked;
+
+        // El evaluador de contacto decide si la mano esta cerca, tocando o agarrando el objeto.
+        contactAssessor.UpdateSignals(
+            fsrValue: rawFsrValue, imuAngularDeltaDeg: contactMotionDeltaDeg, handPosition: handPos,
+            handTracked: handTracked, cubeTrackedPosition: transform.position,
+            yoloDetectionPosition: _lastYoloPosition, hasYoloThisFrame: _hasYoloThisFrame, currentTime: Time.time);
+
+        // Con contacto actualizado, se resuelve puente de oclusion, agarre y transform final.
+        UpdateOcclusionBridge(grip, imuLinearMotion);
+        imuMotionDebug?.Log(this, imuLinearMotion, contactMotionDeltaDeg, rawFsrValue, grip);
+
+        // La marca de YOLO dura solo un frame: si no llega nueva deteccion, el siguiente LateUpdate lo sabra.
+        _hasYoloThisFrame = false;
+
+        UpdateGripState(grip, release, rawRot);
+        ApplyTransform(_calibrationOffset * rawRot);
+        LogSessionCsvData(rawRot, rawFsrValue, grip, imuDeltaDeg);
     }
 
-    // Lee la rotación del IMU y el estado del FSR del dispositivo BLE asignado.
-    // Si no hay datos, mantiene la última rotación válida.
-    private void ReadSensorData(out Quaternion rawRot, out bool grip, out bool release)
+    private void LogSessionCsvData(Quaternion rawRot, int rawFsrValue, bool fsrGrip, float imuDeltaDeg)
     {
-        // Valores por defecto: última rotación conocida, sin grip ni release
-        rawRot = _lastValidSensorRotation; grip = release = false;
+        // Vuelca sensores, pose fusionada y estado de cubo en los CSV de fondo.
+        BackgroundDataLogger logger = BackgroundDataLogger.Instance;
+        if (logger == null) return;
 
-        DeviceData data = BLEManager.Instance?.GetDeviceByName(assignedName);
-        if (data == null) return;
+        BLEManager ble = BLEManager.Instance;
+        DeviceData deviceData = ble != null ? ble.GetDeviceByName(assignedName) : null;
+        if (deviceData != null && (deviceData.HasImuData || deviceData.HasGripData))
+        {
+            logger.LogSensorData(assignedName, rawRot, rawFsrValue);
+        }
 
-        // FSR con histéresis: umbral de entrada más alto que el de salida
-        // para evitar que oscile entre grip y no grip
-        grip = data.grip > gripThresholdEnter;
-        release = data.grip < gripThresholdExit;
+        Quaternion currentRot = visualObject != null ? visualObject.rotation : transform.rotation;
+        Vector3 currentPos = transform.position;
+        Vector3 velocity = Vector3.zero;
+        float speedMps = 0f;
+        float angularVelocityDegS = 0f;
 
-        // Si el quaternion tiene w=0, el IMU aún no ha enviado datos válidos
-        if (data.orientation.w != 0f)
-            rawRot = Quaternion.Euler(mountingRotation) * data.orientation.normalized;
+        // La primera muestra no tiene "anterior"; desde la segunda se calculan velocidades por diferencia.
+        if (_hasLastLoggedPose && Time.deltaTime > 0f)
+        {
+            velocity = (currentPos - _lastLoggedPosition) / Time.deltaTime;
+            speedMps = velocity.magnitude;
+            angularVelocityDegS = Quaternion.Angle(_lastLoggedRotation, currentRot) / Time.deltaTime;
+        }
+
+        _lastLoggedPosition = currentPos;
+        _lastLoggedRotation = currentRot;
+        _hasLastLoggedPose = true;
+
+        logger.LogFusionData(assignedName, currentPos, currentRot, _isGripping, _cachedDownAxis);
+
+        // gripSource explica de donde viene el agarre registrado: FSR real, puente IMU o nada.
+        string gripSource = _isGripping ? "fsr" : (_isOcclusionBridgeActive ? "imu_bridge" : "none");
+        logger.LogCubeStateData(
+            assignedName, currentPos, currentRot, velocity, speedMps, angularVelocityDegS, _isGripping,
+            gripSource, contactAssessor.Level.ToString(), rawFsrValue, imuDeltaDeg, _cachedDownAxis);
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  Máquina de estados del grip
-    // ══════════════════════════════════════════════════════════════════
-
-    // El grip funciona con histéresis del FSR (sensor de presión):
-    //   - Entra en grip cuando FSR > gripThresholdEnter
-    //   - Sale de grip cuando FSR < gripThresholdExit
-    //   - Cooldown entre release y siguiente grip para evitar rebotes
-    //
-    // Al soltar: recaptura el offset de calibración completo (3D, no solo yaw)
-    // para preservar qué cara está abajo después de girar el cubo.
-    private void UpdateGripState(bool grip, bool release, Quaternion currentRaw)
+    private float GetContactMotionDeltaDeg(float angularDeltaDeg, float imuLinearMotion)
     {
+        // Convierte aceleracion lineal IMU en evidencia angular equivalente para el evaluador de contacto.
+        if (imuLinearMotionThreshold <= 0f || imuLinearMotion < imuLinearMotionThreshold)
+            return angularDeltaDeg;
+
+        float assessorThreshold = Mathf.Max(0.0001f, contactAssessor.imuMotionThresholdDeg);
+        float linearMotionAsDelta = assessorThreshold * (imuLinearMotion / imuLinearMotionThreshold);
+        return Mathf.Max(angularDeltaDeg, linearMotionAsDelta);
+    }
+
+    private void ReadSensorData(out Quaternion rawRot, out bool grip, out bool release, out int rawFsrValue, out float imuLinearMotion)
+    {
+        // Lee el paquete BLE asociado al tracker y deja valores seguros si el dispositivo falta.
+        // out significa que el metodo devuelve varios valores a la vez: rotacion, agarre, liberacion, etc.
+        rawRot = _lastValidSensorRotation; grip = release = false; rawFsrValue = 0; imuLinearMotion = 0f;
+        BLEManager ble = BLEManager.Instance;
+        DeviceData deviceData = ble != null ? ble.GetDeviceByName(assignedName) : null;
+        if (deviceData == null) return;
+        rawFsrValue = deviceData.grip;
+        imuLinearMotion = deviceData.imuLinearMotion;
+        _lastReadImuLinearMotion = imuLinearMotion;
+        _lastImuPayloadLength = deviceData.imuPayloadLength;
+        _lastImuHasLinearMotion = deviceData.imuPayloadLength >= 20;
+        grip = deviceData.grip > gripThresholdEnter; release = deviceData.grip < gripThresholdExit;
+        if (deviceData.orientation.w != 0f) rawRot = Quaternion.Euler(mountingRotation) * deviceData.orientation.normalized;
+    }
+
+    private void UpdateGripState(bool fsrGrip, bool fsrRelease, Quaternion currentRaw)
+    {
+        // Cambia entre agarre y liberacion usando umbrales FSR con cooldown.
+        // Cuando entra en agarre, la posicion pasa a estar anclada a la mano hasta que el FSR baja.
         if (!_isGripping)
         {
-            // ── Intentar entrar en grip ──
-            // Condiciones: FSR dice grip + ha pasado el cooldown + tenemos referencia de mano
-            if (grip && Time.time > _lastReleaseTime + grabCooldown && trackingHand != null)
+            if (fsrGrip && Time.time > _lastReleaseTime + grabCooldown && trackingHand != null)
             {
-                _isGripping = true;
-
-                Debug.Log($"[FT:{myColorIdentity}] ★ GRIP START → trackingHand=\"{trackingHand.gameObject.name}\" " +
-                          $"(ID={trackingHand.GetInstanceID()}) pos={trackingHand.transform.position}");
-
-                // Hacer kinematic para que la física no interfiera durante el grip
-                if (_rb != null) _rb.isKinematic = true;
-
-                // Guardar la posición del cubo en espacio local de la mano.
-                // Así cuando la mano se mueva, el cubo la sigue manteniendo
-                // la misma posición relativa.
-                _gripLocalPosition = trackingHand.transform.InverseTransformPoint(transform.position);
-
-                if (_expEnabled) OnGripStarted?.Invoke(ExperimentClock.Now);
+                StopOcclusionBridge();
+                EnterGrip(currentRaw);
             }
-        }
-        else if (release)
-        {
-            // ── Salir del grip ──
-            _isGripping = false; _lastReleaseTime = Time.time;
-
-            // Restaurar física
-            if (_rb != null) _rb.isKinematic = false;
-
-            if (_expEnabled) OnGripEnded?.Invoke(ExperimentClock.Now);
-
-            // Poner el cubo donde la mano lo soltó
-            if (trackingHand != null)
-            {
-                Vector3 releasePos = trackingHand.transform.TransformPoint(_gripLocalPosition);
-                _visualTargetPosition = releasePos;
-                transform.position = releasePos;
-            }
-
-            // ── Recapturar offset de calibración COMPLETO ────────────
-            // Fórmula: newOffset * currentRaw = visualObject.rotation
-            //        → newOffset = visualObject.rotation * Inverse(currentRaw)
-            // Esto captura TODO: qué cara está abajo, hacia dónde apunta.
-            // Es crucial porque el usuario puede haber girado el cubo 
-            // mientras lo tenía en la mano.
-            Quaternion fullOffset = visualObject.rotation * Quaternion.Inverse(currentRaw);
-            _calibrationOffset = _targetCalibrationOffset = fullOffset;
-
-            // Forzar que la próxima detección visual actualice posición (sin deadzone)
-            _forceNextVisualUpdate = true;
-
-            // Armar la calibración post-release: esperamos una buena detección
-            _pendingPostReleaseCalib = true;
-
-            // Resetear el estimador de bias porque la situación ha cambiado
-            _biasReferenceSet = false;
-            _stableRestTime = 0f;
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  Aplicación del transform final
-    // ══════════════════════════════════════════════════════════════════
-
-    // Dos modos según si el cubo está en la mano o en la mesa:
-    //   - En mano: rotación 3D completa del IMU + posición de la mano
-    //   - En mesa: bloqueo de cara (SnapDownAxisToWorldDown) + lerp de posición
-    private void ApplyTransform(Quaternion idealRot)
-    {
-        if (_isGripping)
-        {
-            // En mano: seguir la posición de la mano y usar la rotación IMU tal cual
-            if (trackingHand != null) transform.position = trackingHand.transform.TransformPoint(_gripLocalPosition);
-            visualObject.rotation = idealRot; _smoothedRotation = idealRot;
         }
         else
         {
-            // En mesa: bloquear la cara inferior contra el suelo y solo permitir yaw.
-            // Esto evita que el cubo "flote" o se incline por ruido del IMU.
-            Quaternion stableRot = SnapDownAxisToWorldDown(idealRot);
-
-            // Interpolar posición suavemente hacia el target visual
-            Vector3 target = _visualTargetPosition;
-            transform.position = Vector3.Lerp(transform.position, target, Time.deltaTime * visualCorrectionSpeed);
-
-            // Interpolar rotación suavemente, con un mínimo para evitar
-            // micro-oscilaciones innecesarias
-            if (Quaternion.Angle(_smoothedRotation, stableRot) > 0.05f)
-                _smoothedRotation = Quaternion.Slerp(_smoothedRotation, stableRot, Time.deltaTime * rotationSmoothSpeed);
-            else
-                _smoothedRotation = stableRot;
-            visualObject.rotation = _smoothedRotation;
+            if (fsrRelease) ExitGrip(currentRaw);
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  Bloqueo de cara inferior (face-down lock)
-    // ══════════════════════════════════════════════════════════════════
-
-    // Eje local que apunta hacia abajo actualmente. Se cachea para histéresis:
-    // no cambiamos de cara a menos que otra sea SIGNIFICATIVAMENTE mejor.
-    private Vector3 _cachedDownAxis = Vector3.down;
-
-    // Cuando el cubo está en la mesa, queremos que una de sus 6 caras esté
-    // perfectamente plana contra el suelo (sin inclinación). Solo dejamos
-    // que rote en yaw (girar sobre sí mismo).
-    //
-    // Algoritmo:
-    //   1. Comprobar cuál de los 6 ejes locales apunta más hacia abajo
-    //   2. Histéresis de 0.15 para no cambiar de cara por ruido
-    //   3. Calcular la rotación que pone ese eje exactamente hacia abajo
-    //   4. Extraer solo el yaw del resto de la rotación
-    //   5. Reconstruir: faceDown * yawOnly = rotación final estable
-    private Quaternion SnapDownAxisToWorldDown(Quaternion rot)
+    private void UpdateOcclusionBridge(bool fsrGrip, float imuLinearMotion)
     {
-        // Los 6 ejes locales posibles que podrían estar apuntando hacia abajo
-        Vector3[] localAxes = {
-            Vector3.down, Vector3.up,
-            Vector3.left, Vector3.right,
-            Vector3.back, Vector3.forward
-        };
-
-        // ¿El eje cacheado sigue apuntando bien hacia abajo?
-        Vector3 currentDown = rot * _cachedDownAxis;
-        float currentDot = Vector3.Dot(currentDown, Vector3.down);
-
-        // Solo cambiar a otro eje si es significativamente mejor (histéresis)
-        // Esto evita que el cubo "parpadee" entre caras cuando está en un ángulo límite
-        Vector3 bestAxis = _cachedDownAxis;
-        float bestDot = currentDot;
-        float hysteresis = 0.15f;
-
-        foreach (Vector3 axis in localAxes)
+        // Mantiene una posicion guiada por la mano cuando la vision se pierde por oclusion.
+        // Es deliberadamente conservador: solo entra con mano cercana, movimiento IMU y sin otro tracker mejor.
+        // Estado inactivo: acumula evidencia de entrada. Estado activo: sigue un punto local en la mano
+        // hasta que hay reposo, la mano se aleja o se agota el tiempo maximo.
+        if (!enableImuOcclusionHandBridge || _isGripping || fsrGrip || trackingHand == null || !trackingHand.IsTracked)
         {
-            Vector3 worldAxis = rot * axis;
-            float dot = Vector3.Dot(worldAxis, Vector3.down);
-            if (dot > bestDot + hysteresis)
-            {
-                bestDot = dot;
-                bestAxis = axis;
-            }
+            StopOcclusionBridge();
+            return;
         }
-        _cachedDownAxis = bestAxis;
 
-        // Paso 1: rotación que pone el eje elegido exactamente hacia abajo
-        Quaternion faceDownBase = Quaternion.FromToRotation(_cachedDownAxis, Vector3.down);
+        float visionAge = Time.time - LastVisualUpdateTime;
+        bool bridgeEntryMotion = HasBridgeEntryMotion(imuLinearMotion);
+        bool bridgeReleaseRest = IsBridgeReleaseRest(imuLinearMotion);
+        Vector3 handPos = trackingHand.transform.position;
+        float handToObject = Vector3.Distance(handPos, transform.position);
+        float handToVisualTarget = Vector3.Distance(handPos, _visualTargetPosition);
 
-        // Paso 2: lo que sobra después de quitar faceDown = yaw + ruido de pitch/roll
-        Quaternion remainder = Quaternion.Inverse(faceDownBase) * rot;
+        // Se guarda memoria de que la mano cubrio la zona para tolerar perdidas visuales breves.
+        UpdateOcclusionBridgeCoverMemory(handPos, handToObject, handToVisualTarget);
+        bool coverRecent = HasRecentOcclusionBridgeCover();
+        bool visionTooOld = !_hasAcceptedVisualPosition || (visionAge > occlusionBridgeMaxSeconds && !coverRecent);
 
-        // Paso 3: quedarnos solo con el yaw del residuo
-        float yaw = remainder.eulerAngles.y;
-        Quaternion yawOnly = Quaternion.Euler(0f, yaw, 0f);
+        if (_isOcclusionBridgeActive)
+        {
+            // Si el puente esta activo, se conserva mientras la mano siga vinculada y no expire.
+            // Esta rama solo decide si seguir, mezclar con vision recuperada o salir del puente.
+            float maxActiveSeconds = Mathf.Max(occlusionBridgeMaxSeconds, occlusionBridgeMaxActiveSeconds);
+            bool bridgeExpired = Time.time - _occlusionBridgeStartTime > maxActiveSeconds;
 
-        // Paso 4: reconstruir la rotación final = cara plana + solo giro horizontal
-        return faceDownBase * yawOnly;
+            // Para cerrar por reposo se exigen varios frames, evitando parpadeos por ruido de la IMU.
+            bool noCurrentHandLinkAtRest = !IsHandCurrentlyLinkedForOcclusionBridge(handPos, handToObject, handToVisualTarget) && bridgeReleaseRest;
+
+            if (bridgeReleaseRest || noCurrentHandLinkAtRest)
+                _occlusionBridgeRestExitCount++;
+            else
+                _occlusionBridgeRestExitCount = 0;
+
+            if (_occlusionBridgeRestExitCount >= occlusionBridgeReleaseRestFrames)
+            {
+                StopOcclusionBridge();
+                return;
+            }
+
+            bool handLeft = !IsHandCurrentlyLinkedForOcclusionBridge(handPos, handToObject, handToVisualTarget);
+            bool shouldExit = handLeft || bridgeExpired;
+            
+            if (shouldExit)
+            {
+                _occlusionBridgeExitCount++;
+                if (_occlusionBridgeExitCount >= occlusionBridgeExitFrames)
+                    StopOcclusionBridge();
+            }
+            else
+            {
+                _occlusionBridgeExitCount = 0;
+                if (_hasYoloThisFrame)
+                {
+                    // Cuando vuelve vision, mezcla suavemente el ancla de mano hacia el objetivo visual.
+                    Vector3 currentTarget = trackingHand.transform.TransformPoint(_occlusionBridgeLocalPosition);
+                    Vector3 blendedTarget = Vector3.Lerp(currentTarget, _visualTargetPosition, 0.35f);
+                    _occlusionBridgeLocalPosition = trackingHand.transform.InverseTransformPoint(blendedTarget);
+                }
+            }
+            return;
+        }
+
+        // A partir de aqui el puente esta apagado. Estas condiciones bloquean la entrada.
+        if (visionTooOld || !bridgeEntryMotion ||
+            Time.time - _lastOcclusionBridgeStopTime < occlusionBridgeReentryCooldownSeconds ||
+            IsOcclusionBridgeOwnedByAnotherTracker())
+        {
+            _occlusionBridgeEntryCount = 0;
+            return;
+        }
+
+        bool isCloseEnough = IsHandCloseEnoughForOcclusionBridge(handPos, handToObject, handToVisualTarget);
+        if (!isCloseEnough && !coverRecent)
+        {
+            _occlusionBridgeEntryCount = 0;
+            return;
+        }
+
+        if (!IsBestOcclusionBridgeCandidate(handPos))
+        {
+            _occlusionBridgeEntryCount = 0;
+            return;
+        }
+
+        // Entrada con histéresis: no basta un frame bueno, hacen falta occlusionBridgeEntryFrames.
+        _occlusionBridgeEntryCount++;
+        if (_occlusionBridgeEntryCount >= occlusionBridgeEntryFrames)
+        {
+            // Activa el puente y guarda la posicion local respecto a la mano para seguirla.
+            _isOcclusionBridgeActive = true;
+            _occlusionBridgeOwner = this;
+            _occlusionBridgeExitCount = 0;
+            _occlusionBridgeRestExitCount = 0;
+            
+            Vector3 bridgeObjectStart;
+            if (!isCloseEnough && coverRecent)
+            {
+                // Si la mano cubre la mesa pero no esta exactamente encima, se empieza entre vision y mano.
+                bridgeObjectStart = Vector3.Lerp(_visualTargetPosition, handPos, 0.7f);
+            }
+            else
+            {
+                bridgeObjectStart = _visualTargetPosition;
+            }
+
+            _occlusionBridgeLocalPosition = trackingHand.transform.InverseTransformPoint(bridgeObjectStart);
+            _occlusionBridgeStartTime = Time.time;
+        }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  Reset de estado
-    // ══════════════════════════════════════════════════════════════════
+    private void UpdateOcclusionBridgeCoverMemory(Vector3 handPos, float handToObject, float handToVisualTarget)
+    {
+        // Recuerda durante unos instantes que la mano cubrio la zona, aunque luego se separe un poco.
+        if (!_hasAcceptedVisualPosition) return;
+        if (IsHandDirectlyCloseForOcclusionBridge(handToObject, handToVisualTarget) || IsHandCoveringTableArea(handPos))
+        {
+            _lastOcclusionBridgeCoverTime = Time.time;
+        }
+    }
 
-    // Resetea todo. Llamado al reconectar BLE o al reiniciar la sesión.
+    internal bool IsHandCloseEnoughForOcclusionBridge(Vector3 handPos, float handToObject, float handToVisualTarget)
+    {
+        // Combina cercania directa con cobertura de la zona de mesa.
+        return IsHandDirectlyCloseForOcclusionBridge(handToObject, handToVisualTarget) || IsHandCoveringTableArea(handPos);
+    }
+
+    private bool IsHandCurrentlyLinkedForOcclusionBridge(Vector3 handPos, float handToObject, float handToVisualTarget)
+    {
+        // Durante el puente activo se usa un radio mas laxo para evitar cortes por ruido de mano.
+        if (_isOcclusionBridgeActive)
+        {
+            float looseRadius = Mathf.Max(occlusionBridgeEntryRadius * 3.5f, 0.16f);
+            float closestHandDistance = Mathf.Min(handToObject, handToVisualTarget);
+            if (closestHandDistance <= looseRadius) return true;
+
+            return IsHandCoveringTableArea(handPos);
+        }
+
+        return IsHandDirectlyCloseForOcclusionBridge(handToObject, handToVisualTarget) || IsHandCoveringTableArea(handPos);
+    }
+
+    private bool IsHandDirectlyCloseForOcclusionBridge(float handToObject, float handToVisualTarget)
+    {
+        // Evalua cercania de mano al objeto real o al objetivo visual, ampliada si hay contacto reciente.
+        float closestHandDistance = Mathf.Min(handToObject, handToVisualTarget);
+        if (closestHandDistance <= occlusionBridgeEntryRadius) return true;
+
+        if (contactAssessor.Level < ContactLevel.Nearby) return false;
+
+        float contactRadius = Mathf.Max(occlusionBridgeEntryRadius, contactAssessor.nearbyRadius + occlusionBridgeContactSlack);
+        return closestHandDistance <= contactRadius;
+    }
+
+    internal bool HasRecentOcclusionBridgeCover()
+    {
+        // Indica si la cobertura de mano sigue dentro de la ventana de memoria.
+        return occlusionBridgeCoverMemorySeconds > 0f && Time.time - _lastOcclusionBridgeCoverTime <= occlusionBridgeCoverMemorySeconds;
+    }
+
+    private bool IsHandCoveringTableArea(Vector3 handPos)
+    {
+        // Determina si la mano cubre la zona donde se espera el objeto sobre la mesa.
+        float tableCoverDistance = GetTableCoverDistance(handPos);
+        return tableCoverDistance >= 0f && tableCoverDistance <= occlusionBridgeTableCoverRadius;
+    }
+
+    private float GetTableCoverDistance(Vector3 handPos)
+    {
+        // Mide distancia XZ de la mano al objeto y al objetivo visual cuando hay bloqueo a mesa.
+        if (!lockToTable || occlusionBridgeTableCoverRadius <= 0f) return -1f;
+
+        Vector2 handXZ = new Vector2(handPos.x, handPos.z);
+        float handToObjectXZ = Vector2.Distance(handXZ, new Vector2(transform.position.x, transform.position.z));
+        float handToVisualXZ = Vector2.Distance(handXZ, new Vector2(_visualTargetPosition.x, _visualTargetPosition.z));
+        return Mathf.Min(handToObjectXZ, handToVisualXZ);
+    }
+
+    internal bool HasBridgeEntryMotion(float imuLinearMotion)
+    {
+        // Requiere movimiento lineal suficiente para entrar al puente de oclusion.
+        float threshold = Mathf.Max(imuLinearMotionThreshold, occlusionBridgeEntryLinearMotionThreshold);
+        return threshold > 0f && imuLinearMotion >= threshold;
+    }
+
+    internal bool IsBridgeReleaseRest(float imuLinearMotion)
+    {
+        // Detecta reposo suficiente para cerrar el puente sin esperar a vision.
+        float threshold = Mathf.Max(0.001f, occlusionBridgeReleaseLinearMotionThreshold);
+        return imuLinearMotion <= threshold;
+    }
+
+    internal bool IsOcclusionBridgeOwnedByAnotherTracker()
+    {
+        // Solo un tracker puede poseer el puente de oclusion en un momento dado.
+        return _occlusionBridgeOwner != null && _occlusionBridgeOwner != this;
+    }
+
+    private float GetOcclusionBridgeCandidateDistance(Vector3 handPos)
+    {
+        // Calcula la distancia competitiva de este objeto para decidir si merece el puente.
+        // Devuelve -1 cuando este tracker no es candidato razonable.
+        float bestDistance = float.MaxValue;
+        float tableDistance = GetTableCoverDistance(handPos);
+        if (tableDistance >= 0f && tableDistance <= occlusionBridgeTableCoverRadius)
+            bestDistance = tableDistance;
+
+        float directDistance = Mathf.Min(
+            Vector3.Distance(handPos, transform.position),
+            Vector3.Distance(handPos, _visualTargetPosition));
+        float directRadius = Mathf.Max(occlusionBridgeEntryRadius, contactAssessor.nearbyRadius + occlusionBridgeContactSlack);
+        if (directDistance <= directRadius)
+            bestDistance = Mathf.Min(bestDistance, directDistance);
+
+        return bestDistance == float.MaxValue ? -1f : bestDistance;
+    }
+
+    internal bool IsBestOcclusionBridgeCandidate(Vector3 handPos)
+    {
+        // Compara este tracker contra los demas para evitar que dos objetos sigan la misma mano.
+        // Si otro tracker esta mas cerca o se mueve mucho mas, este se retira.
+        float myDistance = GetOcclusionBridgeCandidateDistance(handPos);
+        if (myDistance < 0f) return false;
+
+        for (int i = ActiveTrackers.Count - 1; i >= 0; i--)
+        {
+            FusionTracker tracker = ActiveTrackers[i];
+            if (tracker == null) { ActiveTrackers.RemoveAt(i); continue; }
+            if (tracker == this || !tracker.isActiveAndEnabled || !tracker.enableImuOcclusionHandBridge) continue;
+            if (tracker.trackingHand != trackingHand && tracker.trackingHand != null && trackingHand != null) continue;
+
+            float otherDistance = tracker.GetOcclusionBridgeCandidateDistance(handPos);
+            if (otherDistance >= 0f && otherDistance + occlusionBridgeCandidateSwitchMargin < myDistance) return false;
+            bool otherMovingMuchMore = tracker.LastLinearMotion > _lastReadImuLinearMotion * 2f;
+            bool similarDistance = Mathf.Abs(otherDistance - myDistance) < occlusionBridgeCandidateSwitchMargin;
+            if (otherDistance >= 0f && similarDistance && otherMovingMuchMore) return false;
+        }
+        return true;
+    }
+
+    private void StopOcclusionBridge()
+    {
+        // Apaga el puente de oclusion y libera la propiedad global si era de este tracker.
+        bool wasActive = _isOcclusionBridgeActive;
+        _isOcclusionBridgeActive = false;
+        _occlusionBridgeEntryCount = 0;
+        _occlusionBridgeExitCount = 0;
+        _occlusionBridgeRestExitCount = 0;
+        if (_occlusionBridgeOwner == this) _occlusionBridgeOwner = null;
+        if (wasActive) _lastOcclusionBridgeStopTime = Time.time;
+    }
+
+    private void EnterGrip(Quaternion currentRaw)
+    {
+        // En agarre FSR, el objeto pasa a seguir la mano y deja de depender de vision.
+        // Se guarda la posicion local respecto a la mano para conservar la distancia/orientacion del agarre.
+        _isGripping = true;
+        if (_rb != null) _rb.isKinematic = true;
+        if (trackingHand != null) _gripLocalPosition = trackingHand.transform.InverseTransformPoint(transform.position);
+    }
+
+    private void ExitGrip(Quaternion currentRaw)
+    {
+        // Al soltar, coloca el objeto donde estaba la mano y pide una recalibracion visual posterior.
+        // Despues de soltar puede haber un salto entre IMU y vision; por eso se marca _pendingPostReleaseCalib.
+        _isGripping = false; _lastReleaseTime = Time.time;
+        if (_rb != null) _rb.isKinematic = false;
+
+        if (trackingHand != null)
+        {
+            Vector3 releasePos = trackingHand.transform.TransformPoint(_gripLocalPosition);
+            _visualTargetPosition = releasePos; transform.position = releasePos;
+        }
+
+        _calibrationOffset = _targetCalibrationOffset = visualObject.rotation * Quaternion.Inverse(currentRaw);
+        _pendingPostReleaseCalib = true;
+        StopOcclusionBridge();
+        _forceNextVisualUpdate = true;
+    }
+
+    private void ApplyTransform(Quaternion idealRot)
+    {
+        // Unico punto que escribe la pose final del GameObject.
+        // Prioridad: agarre FSR > puente de oclusion mano/IMU > vision suavizada + rotacion BLE.
+        if (_isGripping)
+        {
+            // Agarre confirmado por FSR: la mano manda posicion y el IMU manda rotacion.
+            if (trackingHand != null && trackingHand.IsTracked)
+            {
+                transform.SetPositionAndRotation(
+                    trackingHand.transform.TransformPoint(_gripLocalPosition),
+                    idealRot);
+            }
+            else
+            {
+                transform.rotation = idealRot;
+            }
+
+            _smoothedRotation = idealRot;
+        }
+        else if (_isOcclusionBridgeActive && trackingHand != null && trackingHand.IsTracked)
+        {
+            // Puente activo: no hay FSR, pero hay evidencia IMU/mano suficiente para seguir la mano.
+            transform.SetPositionAndRotation(
+                trackingHand.transform.TransformPoint(_occlusionBridgeLocalPosition),
+                idealRot);
+            _smoothedRotation = idealRot;
+        }
+        else
+        {
+            // Fuera de agarre, mezcla posicion visual y rotacion fisica segun nivel de manipulacion.
+            // Si no se manipula, ShapePolicy puede encajar el objeto en una pose estable sobre la mesa.
+            bool isManipulated = contactAssessor.Level >= ContactLevel.Touching || contactAssessor.IsIMUMoving;
+            Quaternion stableRot = (shape != null && !isManipulated) ? shape.SnapRestingPose(idealRot, ref _cachedDownAxis) : idealRot;
+
+            // La velocidad de seguimiento cambia segun confianza: mas rapida durante contacto/movimiento.
+            float speed = visualCorrectionSpeed;
+            if (contactAssessor.Level >= ContactLevel.Touching) speed *= 4f;
+            else if (contactAssessor.IsIMUMoving) speed *= 2.5f;
+            else speed *= 0.5f;
+
+            bool movingWithoutFsr = !_isGripping && isManipulated && (Time.time - LastVisualUpdateTime) < 0.15f;
+
+            if (movingWithoutFsr)
+            {
+                // Si hay movimiento sin FSR pero vision fresca, evita retraso en la posicion.
+                transform.position = _visualTargetPosition;
+            }
+            else
+            {
+                transform.position = Vector3.Lerp(transform.position, _visualTargetPosition, Time.deltaTime * speed);
+            }
+
+            if (isManipulated)
+            {
+                // Durante manipulacion real no se suaviza la rotacion para no retrasar la respuesta.
+                _smoothedRotation = stableRot;
+            }
+            else
+            {
+                if (Quaternion.Angle(_smoothedRotation, stableRot) > 0.05f)
+                    _smoothedRotation = Quaternion.Slerp(_smoothedRotation, stableRot, Time.deltaTime * rotationSmoothSpeed);
+                else _smoothedRotation = stableRot;
+            }
+
+            transform.rotation = _smoothedRotation;
+        }
+    }
+
     public void ResetState()
     {
+        // Reinicia calibracion, contacto, puente, logs y visuales auxiliares para un nuevo ensayo.
+        // No destruye el tracker ni cambia su identidad: BLE/FSM pueden reutilizarlo tras reconexion.
         _targetCalibrationOffset = _calibrationOffset = Quaternion.identity;
-        _isGripping = false; _forceNextVisualUpdate = true;
+        _isGripping = false;
+        StopOcclusionBridge();
+        _lastOcclusionBridgeCoverTime = -10f;
+        _hasAcceptedVisualPosition = false;
+        _forceNextVisualUpdate = true;
         _hasInitialCalibration = false; _stableFramesCount = 0;
-        _pendingPostReleaseCalib = false;
-        _cachedDownAxis = Vector3.down;
+        _pendingPostReleaseCalib = false; _cachedDownAxis = Vector3.down;
         ClearOffsetBuffer(); _wasStable = false;
-        _yawBiasEstimate = 0f; _stableRestTime = 0f; _biasReferenceSet = false;
+        _headStableFrames = 0;
+        _lastHeadRotation = playerHead != null ? playerHead.rotation : Quaternion.identity;
+        _hasYoloThisFrame = false;
+        _hasLastLoggedPose = false;
+        _lastLoggedPosition = transform.position;
+        _lastLoggedRotation = visualObject != null ? visualObject.rotation : transform.rotation;
+        contactAssessor.Reset();
 
-        // Ocultar todos los debug visuals
-        if (_kpSpheres != null) foreach (var s in _kpSpheres) if (s) s.SetActive(false);
-        if (_arrowVisual) _arrowVisual.gameObject.SetActive(false);
-        if (_arrowSensor) _arrowSensor.gameObject.SetActive(false);
+        _keypointDebug?.Hide();
     }
 }

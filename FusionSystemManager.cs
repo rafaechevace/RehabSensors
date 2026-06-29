@@ -1,510 +1,582 @@
-﻿// FusionSystemManager.cs
-// Sensor-Fusion Tracking System — AIR Group, ESI-UCLM
-//
-// Orquestador central del sistema de fusión sensorial.
-// Conecta tres subsistemas: visión (YOLO), BLE (IMU + FSR) y fusión (FusionTracker por cubo).
-//
-// Responsabilidades:
-//   - Spawnea un FusionTracker por cubo cuando se conecta su periférico BLE.
-//   - Enruta las detecciones visuales al tracker correcto según color.
-//   - Controla el inicio/parada de la sesión (manual o automático).
-//   - Modo experimentación para ablación y comparación con otros sistemas.
-//
-// Historial relevante:
-//   - La calibración se relajó de 4 keypoints obligatorios a 3+.
-//     El primer modelo YOLO no daba keypoints fiables salvo en poses
-//     concretas; el modelo actual es más estable y nos lo permite.
-//   - IsGeometricValid pasó de ser un gate duro a señal de calidad
-//     por la misma razón: rechazaba demasiadas detecciones válidas.
-//   - El filtro de falsos positivos de mano se añadió después porque
-//     con ciertas iluminaciones YOLO confundía el puño cerrado/semicerrado
-//     con un cubo, causando intermitencias de posición.
-
 using UnityEngine;
+using System.Collections;
 using System.Collections.Generic;
+using Meta.XR.MRUtilityKit;
+using UnityEngine.Serialization;
 
 public class FusionSystemManager : MonoBehaviour
 {
-    // ── Binding color ↔ dispositivo BLE ↔ prefab ─────────────────────
-    // Cada cubo físico tiene un color, se anuncia por BLE con un nombre
-    // que contiene ese color, y tiene un prefab asociado para su gemelo digital.
-
+    // Orquestador de la arquitectura: conecta BLE, vision, mano activa y trackers fisicos.
+    // Aqui se asocian detecciones visuales con objetos inteligentes y se propagan ajustes comunes.
+    // Para entender el flujo: BLE crea/actualiza trackers; vision envia lotes; este manager
+    // decide que deteccion pertenece a que tracker antes de delegar posicion/calibracion.
+    //
+    // Idea clave: este script no calcula la pose final del objeto. Solo responde a eventos
+    // y reparte informacion al FusionTracker correcto.
     [System.Serializable]
-    public class ColorBinding
+    public class DeviceBinding
     {
-        // Substring para matchear contra el nombre BLE (case-insensitive). Ej: "Red" matchea "RehabRed"
+        // Relaciona identidad BLE, color esperado y prefab fisico instanciado en la escena.
+        // nameFilter se compara contra DeviceData.name; colorId ayuda a emparejar detecciones visuales.
         public string nameFilter;
         public DetectedColor colorId;
         public GameObject prefab;
     }
 
-    // ── Configuración en Inspector ───────────────────────────────────
+    // --- Referencias y configuracion global de la escena ---
+    // autoStart permite probar la fusion sin pasar por el flujo completo de MemoryGame.
+    [FormerlySerializedAs("iniciarAutomaticamente")]
+    public bool autoStart = false;
 
-    [Tooltip("Si true, arranca la inferencia al cargar la escena.")]
-    public bool iniciarAutomaticamente = false;
-
-    [Tooltip("Pipeline de visión que emite VisualDetection.")]
+    // Fuente de vision 3D y agente de inferencia que se encienden solo cuando empieza la partida.
     public ObjectDetectionVisualizerV2 visionSource;
-
-    [Tooltip("Agente YOLO. Se deshabilita hasta que arranque el juego.")]
     public Behaviour inferenceAgent;
 
-    [Tooltip("Mano derecha OVR, se pasa a cada FusionTracker para manipulación por grip.")]
+    // Manos de escena: MemoryGame decide cual es activa y este manager la copia a todos los trackers.
     public OVRHand sceneRightHand;
-
-    [Tooltip("Mano izquierda OVR, alternativa para pacientes que usen la mano izquierda.")]
     public OVRHand sceneLeftHand;
-
-    // Mano activa para tracking. Se elige desde MemoryGame según el toggle
-    // del test de preparación del entorno. Por defecto, mano derecha.
     private OVRHand _activeHand;
 
-    [Tooltip("Audio que suena al iniciar juego.")]
+    // Feedback sonoro de inicio y tabla de correspondencia dispositivo BLE -> prefab/color.
     public AudioSource successAudioSource;
-
-    [Tooltip("Mappings color → nombre BLE → prefab.")]
-    public List<ColorBinding> deviceMappings;
-
+    public List<DeviceBinding> deviceMappings;
     public bool showDebugLogs = true;
 
-    // ── Filtro de falsos positivos de mano ───────────────────────────
-    // Añadido porque YOLO confundía puño cerrado/semicerrado con cubo
-    // en ciertas condiciones de luz, generando saltos de posición.
+    // Filtro anti falsos positivos: evita asignar detecciones pegadas a la mano cuando no corresponden.
     [Header("Hand False-Positive Filter")]
-    [Tooltip("Rechaza detecciones cerca de la mano si el FSR confirma que no hay cubo.")]
     public bool enableHandFPFilter = true;
+    public float handFPMaxDistance = 0.30f;
 
-    [Tooltip("Distancia máxima (m) para considerar que la detección está 'en la mano'. 0.01 = 1cm.")]
-    public float handFPMaxDistance = 0.01f;
+    // Altura de mesa detectada por MRUK. Se propaga a los trackers para bloquear Y de forma coherente.
+    [Header("MRUK Calibration")]
+    public bool useMRUKTableHeight = true;
+    private float _calibratedTableHeight = 0f;
+    private bool _hasTableHeight = false;
 
-    // ── Experimentación ──────────────────────────────────────────────
-    // Para medir y comparar el rendimiento del sistema con otros setups.
-    [Header("Experimentation")]
-    public bool experimentationEnabled = false;
+    // Correccion fina opcional usando vision estable al inicio: compensa pequenos errores de profundidad/mesa.
+    [Header("Auto Table Height Correction")]
+    public bool autoCorrectTableHeightFromVision = true;
+    public int autoTableCorrectionSampleCount = 24;
+    public float maxAutoTableCorrection = 0.06f;
 
-    [Tooltip("Si true, descarta detecciones estocásticamente.")]
-    public bool experimentalGateDetections = false;
+    // --- Estado interno de sesion ---
+    // Lista activa y correccion vertical comun. Estos campos se reinician al iniciar/detener partida.
+    private bool _gameStarted = false;
+    private readonly List<FusionTracker> _activeTrackers = new();
+    private readonly List<float> _autoTableCorrectionSamples = new();
+    private bool _autoTableCorrectionApplied = false;
+    private float _autoTableCorrectionValue = 0f;
 
-    [Range(0f, 1f)]
-    [Tooltip("Probabilidad de que una detección pase el gate.")]
-    public float detectionKeepProbability = 1f;
+    // Devuelve una copia para que otros sistemas no modifiquen la lista interna por accidente.
+    public List<FusionTracker> GetAllTrackers() => new List<FusionTracker>(_activeTrackers);
 
-    [Tooltip("Seed para reproducibilidad.")]
-    public int experimentalSeed = 12345;
+    public IEnumerable<FusionTracker> ActiveTrackers => _activeTrackers;
 
-    // ── Estado interno ───────────────────────────────────────────────
-
-    // Flag de si la sesión está activa. Mientras sea false no se procesan detecciones ni BLE.
-    private bool _juegoIniciado = false;
-
-    // Diccionario que mapea cada color a su FusionTracker. Un tracker por cubo.
-    private readonly Dictionary<DetectedColor, FusionTracker> _activeTrackers = new();
-
-    // RNG con seed fija para que los experimentos de ablación sean reproducibles.
-    private System.Random _rng;
-
-    // ── API pública ──────────────────────────────────────────────────
-
-    // Devuelve copia de la lista de trackers (copia para que nadie modifique el diccionario desde fuera)
-    public List<FusionTracker> GetAllTrackers() => new List<FusionTracker>(_activeTrackers.Values);
-
-    // Versión sin copia para iterar sin allocar memoria (útil en Update loops)
-    public IEnumerable<FusionTracker> ActiveTrackers => _activeTrackers.Values;
-
-    // Configura experimentación en runtime y propaga a todos los trackers activos.
-    public void SetExperimentation(bool enabled, bool gateDetections = false,
-                                   float keepProbability = 1f, int? seed = null)
-    {
-        experimentationEnabled = enabled;
-        experimentalGateDetections = gateDetections;
-
-        // Clamp para asegurar que la probabilidad queda entre 0 y 1
-        detectionKeepProbability = Mathf.Clamp01(keepProbability);
-
-        // Si nos pasan un seed nuevo, recreamos el RNG para que los resultados
-        // sean reproducibles desde ese punto
-        if (seed.HasValue)
-        {
-            experimentalSeed = seed.Value;
-            _rng = new System.Random(experimentalSeed);
-        }
-
-        // Propagar el flag a cada tracker para que ajusten su comportamiento interno
-        foreach (var tracker in _activeTrackers.Values)
-        {
-            if (tracker != null) tracker.SetExperimentation(enabled);
-        }
-    }
-
-    /// <summary>
-    /// Establece qué mano se usa para el tracking de grip.
-    /// Llamado desde MemoryGame según la elección del paciente en la calibración.
-    /// Propaga la mano activa a todos los trackers ya instanciados.
-    /// </summary>
     public void SetActiveHand(bool useRightHand)
     {
-        OVRHand chosen = useRightHand ? sceneRightHand : sceneLeftHand;
-        string label = useRightHand ? "DERECHA" : "IZQUIERDA";
-
-        if (chosen == null)
+        // Todos los objetos fusionados siguen la mano elegida durante la calibracion.
+        _activeHand = useRightHand ? sceneRightHand : sceneLeftHand;
+        if (_activeHand == null)
         {
-            Debug.LogError($"[FSM] ¡¡ {(useRightHand ? "sceneRightHand" : "sceneLeftHand")} " +
-                           $"NO está asignado en el Inspector !!");
-            chosen = useRightHand ? sceneLeftHand : sceneRightHand;
+            Debug.LogError($"[FSM] {(useRightHand ? "sceneRightHand" : "sceneLeftHand")} is not assigned.");
+            _activeHand = useRightHand ? sceneLeftHand : sceneRightHand;
         }
 
-        _activeHand = chosen;
-
-        // Log diagnóstico: nombre del GameObject + InstanceID para verificar
-        // que no son el mismo objeto en ambos slots
-        if (_activeHand != null)
-            Debug.Log($"[FSM] ★ Mano activa = {label} → " +
-                      $"GameObject: \"{_activeHand.gameObject.name}\" " +
-                      $"(InstanceID={_activeHand.GetInstanceID()})");
-        else
-            Debug.LogError("[FSM] ¡¡ _activeHand es NULL — el grip NO funcionará !!");
-
-        // Propagar a todos los trackers ya existentes
-        foreach (var tracker in _activeTrackers.Values)
-        {
+        foreach (var tracker in _activeTrackers)
             if (tracker != null) tracker.trackingHand = _activeHand;
-        }
     }
-
-    // ── Lifecycle ────────────────────────────────────────────────────
 
     private void Start()
     {
-        // ── Validación de manos ──────────────────────────────────────
-        if (sceneRightHand == null)
-            Debug.LogError("[FSM] sceneRightHand NO asignado en Inspector.");
-        if (sceneLeftHand == null)
-            Debug.LogError("[FSM] sceneLeftHand NO asignado en Inspector.");
-        if (sceneRightHand != null && sceneLeftHand != null &&
-            sceneRightHand.GetInstanceID() == sceneLeftHand.GetInstanceID())
-            Debug.LogError("[FSM] ¡¡ sceneRightHand y sceneLeftHand apuntan al MISMO objeto !! " +
-                           $"Ambos son \"{sceneRightHand.gameObject.name}\". " +
-                           "Asigna un OVRHand diferente a cada slot.");
-        else if (sceneRightHand != null && sceneLeftHand != null)
-            Debug.Log($"[FSM] Manos OK: R=\"{sceneRightHand.gameObject.name}\" " +
-                      $"L=\"{sceneLeftHand.gameObject.name}\"");
+        // Start lo llama Unity antes del primer Update.
+        // Vision y BLE se conectan por eventos para reaccionar aunque lleguen en distinto orden.
+        // "Evento" significa: otro script avisa cuando hay datos nuevos y este metodo responde.
+        if (_activeHand == null) _activeHand = sceneRightHand;
 
-        // Solo asignar la mano por defecto si SetActiveHand no se llamó antes.
-        // SetActiveHand se llama desde MemoryGame ANTES de activar detectionRoot,
-        // por lo que _activeHand puede ya estar configurada a la mano izquierda.
-        if (_activeHand == null)
-            _activeHand = sceneRightHand;
-
-        // Suscribirnos a los eventos que nos interesan:
-        // - Cuando la cámara detecta cubos (visión)
-        // - Cuando un dispositivo BLE se conecta
         if (visionSource != null) visionSource.OnVisualDetections += HandleVisualDetections;
         BLEManager.OnConnected += HandleBleConnected;
 
-        // Puede que haya dispositivos BLE que se conectaron antes de que este script
-        // arrancase (ej: viniendo de otra escena). Los registramos ahora.
-        RegisterAlreadyConnectedDevices();
+        if (inferenceAgent != null) inferenceAgent.enabled = false;
+        if (visionSource != null) visionSource.enabled = false;
 
-        // Inicializar el RNG con la seed configurada en Inspector
-        _rng = new System.Random(experimentalSeed);
-
-        if (!iniciarAutomaticamente)
+        if (autoStart)
         {
-            // Si no arrancamos automáticamente, deshabilitamos YOLO y visión.
-            // Se activarán cuando alguien llame a IniciarJuego() (ej: desde un botón UI).
-            if (inferenceAgent != null) inferenceAgent.enabled = false;
-            if (visionSource != null) visionSource.enabled = false;
-        }
-        else
-        {
-            // Modo automático: marcamos como iniciado directamente
-            _juegoIniciado = true;
+            StartGame();
         }
     }
 
     private void OnDestroy()
     {
-        // Desuscribirnos para no dejar callbacks huérfanos al destruir este objeto.
-        // Si no hacemos esto, Unity puede intentar llamar a funciones de un objeto destruido.
+        // Libera eventos para que no lleguen detecciones a un gestor destruido.
         if (visionSource != null) visionSource.OnVisualDetections -= HandleVisualDetections;
         BLEManager.OnConnected -= HandleBleConnected;
     }
 
-    // ── Control de sesión ────────────────────────────────────────────
-
-    // Arranca la sesión de tracking. Llamado desde UI o desde otro script.
-    public void IniciarJuego()
+    public void StartGame()
     {
-        // Evitar doble inicio
-        if (_juegoIniciado) return;
-        _juegoIniciado = true;
+        // Arranca la fusion de partida una sola vez y prepara la correccion de mesa.
+        if (_gameStarted) return;
+        _gameStarted = true;
+        ResetAutoTableCorrection();
+        StartCoroutine(SecuenciaInicioYOLO());
+    }
 
-        // Activar la inferencia YOLO y el pipeline de visión
+    private IEnumerator SecuenciaInicioYOLO()
+    {
+        // Antes de activar vision, intenta fijar altura de mesa para que todos partan de la misma referencia.
+        float timeout = 1.5f;
+        while (!_hasTableHeight && timeout > 0)
+        {
+            CalibrateMRUKTableHeight();
+            if (_hasTableHeight) break;
+            timeout -= Time.deltaTime;
+            yield return null;
+        }
+
         if (inferenceAgent != null) inferenceAgent.enabled = true;
         if (visionSource != null) visionSource.enabled = true;
-
-        // Registrar BLEs que se hayan conectado mientras el juego estaba parado.
-        // Esto pasa si el usuario conecta los cubos antes de darle a "Iniciar".
         RegisterAlreadyConnectedDevices();
-
-        // Feedback sonoro para el usuario
         if (successAudioSource != null) successAudioSource.Play();
     }
 
-    // Para la sesión. Los trackers siguen en memoria pero dejan de recibir datos.
-    public void DetenerJuego()
+    public void StopGame()
     {
-        _juegoIniciado = false;
-
-        // Desactivar inferencia y visión para no gastar recursos innecesariamente
+        // Parar inferencia ahorra bateria y evita detecciones cuando no hay partida activa.
+        _gameStarted = false;
         if (inferenceAgent != null) inferenceAgent.enabled = false;
         if (visionSource != null) visionSource.enabled = false;
     }
 
-    // ── Gestión de dispositivos BLE ──────────────────────────────────
+    public void CalibrateMRUKTableHeight()
+    {
+        if (!useMRUKTableHeight || MRUK.Instance == null) return;
 
-    // Recorre los dispositivos BLE ya conectados y crea trackers para ellos.
-    // Necesario porque el BLE puede conectarse antes de que este script exista
-    // (ej: persistido entre escenas) o antes de que el juego arranque.
+        if (MRUKTableHeightUtility.TryGetHighestTableTop(
+                out float tableTopY,
+                out bool roomAvailable,
+                showDebugLogs,
+                "FusionSystemManager/MRUK"))
+        {
+            _calibratedTableHeight = tableTopY;
+            _hasTableHeight = true;
+            if (showDebugLogs) Debug.Log($"[FusionSystemManager/MRUK] Table calibrated: y={_calibratedTableHeight:F3}");
+            PropagateTableHeight();
+            return;
+        }
+
+        if (!roomAvailable)
+        {
+            if (showDebugLogs) Debug.LogWarning("[FusionSystemManager/MRUK] No room loaded yet.");
+        }
+        else
+        {
+            _hasTableHeight = false;
+            if (showDebugLogs) Debug.LogWarning("[FusionSystemManager/MRUK] No TABLE/DESK anchor found. Height will not be locked by MRUK.");
+        }
+    }
+
+    private void PropagateTableHeight()
+    {
+        // Copia la altura calibrada a todos los trackers ya activos.
+        foreach (var tracker in _activeTrackers)
+        {
+            if (tracker != null)
+            {
+                tracker.tableWorldHeightY = _calibratedTableHeight;
+                tracker.lockToTable = _hasTableHeight;
+            }
+        }
+    }
+
     private void RegisterAlreadyConnectedDevices()
     {
+        // Si BLE ya tenia dispositivos conectados, crea sus trackers al iniciar el juego.
         if (BLEManager.Instance == null) return;
-
-        // Para cada MAC ya conectada, simulamos el evento de conexión
         foreach (string mac in BLEManager.Instance.connectedDevices.Keys)
             HandleBleConnected(mac);
     }
 
-    // Callback que se ejecuta cuando un periférico BLE se conecta.
-    // Busca en deviceMappings a qué color corresponde y spawnea su tracker.
     private void HandleBleConnected(string macAddress)
     {
-        // Si el juego no ha arrancado, ignoramos conexiones BLE.
-        // Ya las pillaremos en RegisterAlreadyConnectedDevices() cuando arranque.
-        if (!_juegoIniciado) return;
-
-        // Obtener los datos del dispositivo por su MAC
+        // Convierte una conexion BLE en tracker fisico cuando el juego esta corriendo.
+        if (!_gameStarted) return;
         DeviceData device = BLEManager.Instance.GetDeviceData(macAddress);
         if (device == null) return;
 
-        // Buscar qué mapping le corresponde comparando el nombre del dispositivo
-        // con cada nameFilter. Ej: si el BLE se llama "RehabRed" y hay un mapping
-        // con nameFilter="Red", matchea y se le asigna el color/prefab de ese mapping.
-        foreach (ColorBinding mapping in deviceMappings)
+        foreach (DeviceBinding mapping in deviceMappings)
         {
             if (device.name.IndexOf(mapping.nameFilter, System.StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 SpawnOrUpdateTracker(mapping, macAddress);
-                return; // Solo un mapping por dispositivo
+                return;
             }
         }
     }
 
-    // Busca un tracker existente para ese color, o instancia el prefab si no hay ninguno.
-    // Después lo configura con la mano, el color, el nombre BLE y lo registra.
-    private void SpawnOrUpdateTracker(ColorBinding mapping, string mac)
+    private void SpawnOrUpdateTracker(DeviceBinding mapping, string mac)
     {
-        // Primero buscar en la escena por si ya hay un tracker de ese color
-        // (puede pasar al volver a una escena o al reconectar un BLE)
-        FusionTracker tracker = FindExistingTracker(mapping.colorId);
+        // Reutiliza trackers para evitar duplicados tras reconexion BLE o prefabs ya presentes.
+        FusionTracker tracker = FindExistingTracker(mapping.nameFilter, mapping.colorId);
 
-        // Si no existe y tenemos prefab, instanciamos uno nuevo
         if (tracker == null && mapping.prefab != null)
         {
             GameObject instance = Instantiate(mapping.prefab);
-            instance.name = $"Tracker_{mapping.colorId}";
-
-            // Intentar obtener el FusionTracker del prefab. Si el prefab no lo tiene,
-            // se lo añadimos nosotros (por si se nos olvidó ponerlo en el prefab).
-            tracker = instance.GetComponent<FusionTracker>() ?? instance.AddComponent<FusionTracker>();
+            instance.name = $"Tracker_{mapping.nameFilter}";
+            if (!instance.TryGetComponent(out tracker))
+                tracker = instance.AddComponent<FusionTracker>();
         }
-
         if (tracker == null) return;
 
-        // Configurar el tracker con todo lo que necesita
-        if (_activeHand != null)
+        if (_activeHand != null) tracker.trackingHand = _activeHand;
+        tracker.myColorIdentity = mapping.colorId;
+        tracker.assignedName = mapping.nameFilter;
+        tracker.ResetState();
+        tracker.autoTableHeightCorrection = _autoTableCorrectionValue;
+
+        if (_hasTableHeight && useMRUKTableHeight)
         {
-            tracker.trackingHand = _activeHand;
-            Debug.Log($"[FSM] Tracker {mapping.colorId}: trackingHand → " +
-                      $"\"{_activeHand.gameObject.name}\" (ID={_activeHand.GetInstanceID()})");
+            // La altura compartida mantiene coherentes vision, juego y objetos fusionados.
+            tracker.tableWorldHeightY = _calibratedTableHeight;
+            tracker.lockToTable = true;
         }
-        else
+        else if (useMRUKTableHeight)
         {
-            Debug.LogError($"[FSM] Tracker {mapping.colorId}: _activeHand es NULL, " +
-                           $"¡trackingHand no se ha asignado!");
+            CalibrateMRUKTableHeight();
+            if (_hasTableHeight)
+            {
+                tracker.tableWorldHeightY = _calibratedTableHeight;
+                tracker.lockToTable = true;
+            }
         }
 
-        tracker.myColorIdentity = mapping.colorId;   // qué color de cubo representa
-        tracker.assignedName = mapping.nameFilter;     // nombre para buscar su BLE en BLEManager
-        tracker.ResetState();                          // limpiar estado previo
-        tracker.SetExperimentation(experimentationEnabled);
-
-        // Registrarlo en nuestro diccionario para poder enrutarle detecciones luego
-        _activeTrackers[mapping.colorId] = tracker;
+        if (!_activeTrackers.Contains(tracker))
+            _activeTrackers.Add(tracker);
     }
 
-    // Busca en toda la escena un FusionTracker que ya tenga asignado este color.
-    // FindObjectsByType es la alternativa moderna a FindObjectsOfType (sin deprecation warning).
-    private static FusionTracker FindExistingTracker(DetectedColor color)
+    private static FusionTracker FindExistingTracker(string assignedName, DetectedColor color)
     {
-        foreach (FusionTracker t in FindObjectsByType<FusionTracker>(FindObjectsSortMode.None))
-        {
-            if (t.myColorIdentity == color) return t;
-        }
+        // Busca un tracker ya instanciado con la misma identidad logica.
+        foreach (FusionTracker tracker in FindObjectsByType<FusionTracker>(FindObjectsSortMode.None))
+            if (tracker.assignedName == assignedName && tracker.myColorIdentity == color) return tracker;
         return null;
     }
 
-    // ── Procesado de detecciones visuales ─────────────────────────────
-    // Este callback se ejecuta cada vez que la cámara+YOLO emite un batch de detecciones.
-    // Cada detección lleva: posición 3D, color detectado, clase (CuboSensor/CuboNormal),
-    // keypoints y si pasa la validación geométrica.
-
     private void HandleVisualDetections(List<VisualDetection> detections)
     {
-        if (!_juegoIniciado) return;
+        // Primero reserva colores claros para resolver detecciones ambiguas dentro del mismo lote.
+        // La asociacion se hace en capas: color/clase, movimiento IMU cerca de la mano y ultimo recurso espacial.
+        // detections es la lista de objetos que YOLO vio en este frame; _activeTrackers son objetos fisicos reales.
+        if (!_gameStarted) return;
+
+        HashSet<FusionTracker> colorClaimedThisBatch = ClaimColorMatchedTrackers(detections);
 
         foreach (VisualDetection det in detections)
         {
-            // Buscar el tracker que corresponde al color de esta detección.
-            // Si no hay tracker para ese color (ej: cubo no conectado por BLE), lo ignoramos.
-            if (!_activeTrackers.TryGetValue(det.ColorCategory, out FusionTracker tracker))
-                continue;
+            FusionTracker targetTracker = FindColorMatchedTracker(det);
+            bool usedColorFallback = false;
 
-            // Filtro de falsos positivos de mano:
-            // Si la detección está pegada a la mano pero el FSR dice que no hay cubo,
-            // YOLO está viendo el puño, no un cubo real. Saltamos toda la detección
-            // (tanto posición como calibración) para evitar intermitencias.
-            if (enableHandFPFilter && IsHandFalsePositive(tracker, det.Position))
+            if (targetTracker == null)
+                targetTracker = TryFindKinematicFallback(det, colorClaimedThisBatch, out usedColorFallback);
+
+            if (targetTracker == null)
             {
-                if (showDebugLogs)
-                    Debug.Log($"[FSM:{det.ColorCategory}] Hand FP filter: skipped");
-                continue;
+                targetTracker = TryFindSpatialFallback(det, colorClaimedThisBatch, out bool usedSpatialFallback);
+                usedColorFallback = usedSpatialFallback;
             }
 
-            // CuboSensor = YOLO detectó la cara del cubo que tiene la pegatina/sticker.
-            // Solo en esta cara tenemos keypoints para calibrar la orientación.
-            if (det.Class == CubeClass.CuboSensor)
+            if (targetTracker == null) continue;
+
+            ApplyDetectionToTracker(det, targetTracker, usedColorFallback);
+        }
+    }
+
+    private HashSet<FusionTracker> ClaimColorMatchedTrackers(List<VisualDetection> detections)
+    {
+        // Esta primera pasada no mueve nada; solo reserva trackers con clase/color claro.
+        // Sirve para que un fallback no "robe" un tracker que ya tuvo una deteccion fiable en el mismo lote.
+        HashSet<FusionTracker> colorClaimedThisBatch = new();
+
+        foreach (VisualDetection det in detections)
+        {
+            FusionTracker tracker = FindColorMatchedTracker(det);
+            if (tracker != null)
             {
-                // Leer la rotación actual del IMU (sensor BLE dentro del cubo)
-                Quaternion sensorRot = GetSensorRotation(tracker);
+                colorClaimedThisBatch.Add(tracker);
+            }
+        }
 
-                // Actualizar la visualización de debug (esferitas en los keypoints
-                // y flechas de dirección). Esto siempre se hace, independientemente
-                // de si vamos a calibrar o no, para poder depurar visualmente.
-                tracker.UpdateKeypointDebug(
-                    det.KeypointsWorld,
-                    det.KeypointWorldValid,
-                    sensorRot);
+        return colorClaimedThisBatch;
+    }
 
-                // Contar cuántos keypoints son válidos en este frame
-                int validCount = CountValidKeypoints(det.KeypointWorldValid);
+    private FusionTracker FindColorMatchedTracker(VisualDetection det)
+    {
+        // Camino principal: asociacion por clase visual y color estimado.
+        // Es el caso ideal: YOLO ve una clase compatible y el color coincide con un tracker.
+        foreach (FusionTracker tracker in _activeTrackers)
+        {
+            if (!IsClassMatch(det, tracker)) continue;
 
-                // Calibración de yaw (orientación horizontal):
-                // Necesitamos al menos 3 keypoints válidos Y que el IMU esté enviando datos
-                // (sensorRot != identity significa que hay datos reales del IMU).
-                //
-                // Antes exigíamos 4/4 + validación geométrica, pero el primer modelo YOLO
-                // no daba keypoints fiables. Con el modelo actual funciona bien con 3+.
-                if (validCount >= 3 && sensorRot != Quaternion.identity)
+            bool singleClass = tracker.shape.VisibleClass == tracker.shape.OccludedClass;
+            bool colorMatch = singleClass || tracker.myColorIdentity == det.ColorCategory;
+
+            if (colorMatch)
+            {
+                return tracker;
+            }
+        }
+
+        return null;
+    }
+
+    private FusionTracker TryFindKinematicFallback(
+        VisualDetection det, HashSet<FusionTracker> colorClaimedThisBatch, out bool usedColorFallback)
+    {
+        // Respaldo cinematico: si la mano oculta el color, el IMU puede revelar que objeto se mueve.
+        // Se usa solo cerca de la mano, porque lejos de la mano la deteccion visual suele ser mas fiable.
+        usedColorFallback = false;
+        bool handIsTracked = _activeHand != null && _activeHand.IsTracked;
+        float distToHand = handIsTracked ? Vector3.Distance(det.Position, _activeHand.transform.position) : 999f;
+        bool handIsNearDet = handIsTracked && distToHand < handFPMaxDistance;
+
+        if (handIsNearDet)
+        {
+            // Se cuentan candidatos en movimiento. Solo se acepta si hay exactamente uno.
+            FusionTracker theOnlyMovingTracker = null;
+            int movingCount = 0;
+            string movingNames = "";
+
+            foreach (FusionTracker tracker in _activeTrackers)
+            {
+                if (!IsClassMatch(det, tracker)) continue;
+                if (colorClaimedThisBatch.Contains(tracker)) continue;
+
+                if (tracker.contactAssessor.IsIMUMoving)
                 {
-                    tracker.ApplyKeypointCalibration(
-                        det.KeypointsWorld,
-                        det.KeypointWorldValid,
-                        sensorRot,
-                        det.IsGeometricValid,   // señal de calidad, ya no bloquea la calibración
-                        validCount);
+                    movingCount++;
+                    theOnlyMovingTracker = tracker;
+                    movingNames += tracker.assignedName + " ";
                 }
             }
 
-            // ── Logging: datos de visión ──
-            if (experimentationEnabled)
+            if (movingCount == 1)
             {
-                float[] vis = new float[4];
-                for (int i = 0; i < 4; i++)
-                    vis[i] = (det.KeypointWorldValid != null &&
-                              i < det.KeypointWorldValid.Length &&
-                              det.KeypointWorldValid[i]) ? 1f : 0f;
-
-                string calibStatus = tracker.HasInitialCalibration ? "ongoing" : "initial";
-                BackgroundDataLogger.Instance?.LogVisionData(
-                    det.ColorCategory.ToString(), det.BBox, det.Score,
-                    det.KeypointsPixel, vis, calibStatus);
+                usedColorFallback = true;
+                Debug.Log($"[FSM-Kinematic] SUCCESS: YOLO did not see the color, but IMU motion revealed: {theOnlyMovingTracker.assignedName}");
+                return theOnlyMovingTracker;
             }
 
-            // Siempre actualizar la posición visual del tracker, sea CuboSensor o CuboNormal.
-            // La posición viene de la bounding box de YOLO proyectada a 3D.
-            tracker.UpdateVisualPosition(det.Position);
+            if (movingCount == 0)
+            {
+                Debug.LogWarning(
+                    $"[FSM-Kinematic] FAILURE: Hand near cube (Color:{det.ColorCategory}), " +
+                    "but no tracker reports motion (IsIMUMoving is false). Lower imuMotionThresholdDeg.");
+            }
+            else
+            {
+                Debug.LogWarning($"[FSM-Kinematic] FAILURE: Ambiguous motion. {movingCount} cubes are moving at once: {movingNames}. The table may have been bumped.");
+            }
+
+            return null;
         }
+
+        if (!handIsTracked)
+            Debug.LogWarning("[FSM-Kinematic] FAILURE: Meta hand tracking was lost on this frame.");
+        else
+            Debug.LogWarning($"[FSM-Kinematic] FAILURE: Detection is {distToHand:F2}m from the wrist. Limit is {handFPMaxDistance:F2}m. Increase handFPMaxDistance.");
+
+        return null;
     }
 
-    // Lee la rotación IMU del cubo vinculado a este tracker.
-    // mountingRotation compensa cómo está montado físicamente el sensor dentro del cubo
-    // (no siempre está alineado con las caras del cubo).
+    private FusionTracker TryFindSpatialFallback(
+        VisualDetection det, HashSet<FusionTracker> colorClaimedThisBatch, out bool usedColorFallback)
+    {
+        // Ultimo recurso: si queda un solo candidato razonable sin reclamar, se usa.
+        // Mantiene continuidad cuando color/clase fallan, pero evita elegir si hay demasiada ambiguedad.
+        usedColorFallback = false;
+        FusionTracker bestElim = null;
+        int unclaimedCount = 0;
+        float bestElimDist = float.MaxValue;
+
+        foreach (FusionTracker tracker in _activeTrackers)
+        {
+            if (!IsClassMatch(det, tracker)) continue;
+            if (colorClaimedThisBatch.Contains(tracker)) continue;
+
+            // De los candidatos no reclamados, se guarda el mas cercano a la deteccion visual.
+            unclaimedCount++;
+            float dist = Vector3.Distance(det.Position, tracker.transform.position);
+            if (dist < bestElimDist)
+            {
+                bestElimDist = dist;
+                bestElim = tracker;
+            }
+        }
+
+        if (unclaimedCount == 1 && bestElim != null)
+        {
+            usedColorFallback = true;
+            return bestElim;
+        }
+
+        if (unclaimedCount > 1 && bestElim != null && bestElimDist < handFPMaxDistance * 2f)
+        {
+            usedColorFallback = true;
+            return bestElim;
+        }
+
+        return null;
+    }
+
+    private void ApplyDetectionToTracker(VisualDetection det, FusionTracker targetTracker, bool usedColorFallback)
+    {
+        // Punto de entrega entre vision y tracker:
+        // - FSM resuelve identidad y filtrado por mano.
+        // - FusionTracker conserva memoria temporal y decide movimiento final en LateUpdate.
+        TryCollectAutoTableCorrection(det, targetTracker);
+        Vector3 detectionPosition = ResolveDetectionPositionForTracker(det, targetTracker);
+
+        targetTracker.NotifyYoloDetection(detectionPosition);
+
+        // Si contacto indica que es mano cercana y no objeto, ignora posicion para no arrastrar el cubo.
+        if (enableHandFPFilter && !usedColorFallback && IsHandFalsePositive(targetTracker, detectionPosition))
+            return;
+
+        if (det.Class == targetTracker.shape.VisibleClass)
+        {
+            // Solo la clase visible aporta keypoints para yaw; la oculta solo actualiza posicion.
+            Quaternion sensorRot = GetSensorRotation(targetTracker);
+
+            // El visualizador debug vive fuera del tracker, pero usa la misma forma y objetivo visual
+            // para que las flechas expliquen exactamente la calibracion que se esta intentando.
+            targetTracker.KeypointDebug.Update(
+                det.KeypointsWorld, det.KeypointWorldValid, sensorRot,
+                targetTracker.shape, targetTracker.ShowKeypointDebug, targetTracker.VisualTargetPosition);
+
+            if (sensorRot != Quaternion.identity)
+            {
+                targetTracker.ApplyKeypointCalibration(
+                    det.KeypointsWorld, det.KeypointWorldValid,
+                    sensorRot, det.IsGeometricValid);
+            }
+        }
+
+        int kpLen = det.KeypointWorldValid != null ? det.KeypointWorldValid.Length : 0;
+        float[] vis = new float[kpLen];
+        for (int i = 0; i < kpLen; i++) vis[i] = det.KeypointWorldValid[i] ? 1f : 0f;
+
+        // El logger guarda estado de calibracion para separar arranque, correccion continua y analisis bruto.
+        // Aunque no haya keypoints utiles, se registra la caja para poder analizar fallos de vision despues.
+        string calibStatus = targetTracker.HasInitialCalibration ? "ongoing" : "initial";
+
+        BackgroundDataLogger logger = BackgroundDataLogger.Instance;
+        if (logger != null)
+        {
+            logger.LogVisionData(det.ColorCategory.ToString(), det.BBox, det.Score, det.KeypointsPixel, vis, calibStatus);
+            logger.LogVisionDataAll(det.ColorCategory.ToString(), det.BBox, det.Score, det.KeypointsPixel, vis, calibStatus);
+        }
+
+        targetTracker.UpdateVisualPosition(detectionPosition);
+    }
+
+    private static bool IsClassMatch(VisualDetection det, FusionTracker tracker)
+    {
+        // Centraliza la comprobacion repetida sin cambiar la regla de asociacion.
+        return tracker != null &&
+               tracker.shape != null &&
+               (det.Class == tracker.shape.VisibleClass || det.Class == tracker.shape.OccludedClass);
+    }
+
+    private Vector3 ResolveDetectionPositionForTracker(VisualDetection det, FusionTracker tracker)
+    {
+        // Si el objeto esta bloqueado a mesa, proyecta la caja al plano calibrado en lugar de usar profundidad.
+        if (tracker == null || !tracker.lockToTable || visionSource == null || tracker.IsGripping)
+            return det.Position;
+
+        float tablePlaneY = tracker.tableWorldHeightY + tracker.tableHeightCorrection + tracker.autoTableHeightCorrection;
+        return visionSource.TryProjectToTablePlane(
+            det.BBox.xMin, det.BBox.yMin, det.BBox.xMax, det.BBox.yMax,
+            tablePlaneY, out Vector3 tableProjectedPosition)
+            ? tableProjectedPosition
+            : det.Position;
+    }
+
+    private void TryCollectAutoTableCorrection(VisualDetection det, FusionTracker tracker)
+    {
+        // Acumula muestras estables de vision para corregir pequenas diferencias entre mesa real y visual.
+        // No corrige mientras hay contacto o movimiento: solo toma muestras cuando el objeto esta quieto.
+        if (!autoCorrectTableHeightFromVision || _autoTableCorrectionApplied) return;
+        if (tracker == null || !tracker.lockToTable || tracker.IsGripping) return;
+        if (!tracker.IsStableForInitial || tracker.CurrentContactLevel >= ContactLevel.Touching) return;
+
+        float expectedCenterY = tracker.GetTableLockedCenterYWithoutAutoCorrection();
+        float sample = det.Position.y - expectedCenterY;
+        if (Mathf.Abs(sample) > maxAutoTableCorrection) return;
+
+        // Cada muestra dice cuanto difiere la vision de la altura de mesa esperada.
+        _autoTableCorrectionSamples.Add(sample);
+        int samplesNeeded = Mathf.Max(5, autoTableCorrectionSampleCount);
+        if (_autoTableCorrectionSamples.Count < samplesNeeded) return;
+
+        // Se aplica una sola vez por sesion para no perseguir ruido durante el juego.
+        float correction = Median(_autoTableCorrectionSamples);
+        ApplyAutoTableCorrection(correction);
+        _autoTableCorrectionApplied = true;
+        _autoTableCorrectionValue = correction;
+
+        if (showDebugLogs)
+            Debug.Log($"[FSM] Auto table height correction applied: {correction:F3}m from {_autoTableCorrectionSamples.Count} stable samples.");
+    }
+
+    private void ApplyAutoTableCorrection(float correction)
+    {
+        // Aplica la correccion al juego si existe; si no, directamente a los trackers activos.
+        if (MemoryGame.Instance != null)
+        {
+            MemoryGame.Instance.SetAutoTableHeightCorrection(correction);
+            return;
+        }
+
+        foreach (var tracker in _activeTrackers)
+            if (tracker != null) tracker.autoTableHeightCorrection = correction;
+    }
+
+    private void ResetAutoTableCorrection()
+    {
+        // Reinicia muestras y elimina correcciones anteriores al empezar una partida nueva.
+        _autoTableCorrectionSamples.Clear();
+        _autoTableCorrectionApplied = false;
+        _autoTableCorrectionValue = 0f;
+        foreach (var tracker in _activeTrackers)
+            if (tracker != null) tracker.autoTableHeightCorrection = 0f;
+        if (MemoryGame.Instance != null) MemoryGame.Instance.SetAutoTableHeightCorrection(0f);
+    }
+
+    private static float Median(List<float> values)
+    {
+        // Usa mediana para que una muestra mala no domine la correccion de mesa.
+        if (values == null || values.Count == 0) return 0f;
+        float[] sorted = values.ToArray();
+        System.Array.Sort(sorted);
+        int mid = sorted.Length / 2;
+        return sorted.Length % 2 == 0
+            ? (sorted[mid - 1] + sorted[mid]) * 0.5f
+            : sorted[mid];
+    }
+
     private static Quaternion GetSensorRotation(FusionTracker tracker)
     {
+        // Combina orientacion BLE con la rotacion de montaje configurada en el tracker.
         if (BLEManager.Instance == null) return Quaternion.identity;
-
-        // Buscar el dispositivo BLE por nombre (ej: "Red" busca el dispositivo cuyo nombre contiene "Red")
-        DeviceData data = BLEManager.Instance.GetDeviceByName(tracker.assignedName);
-
-        // Si no hay datos o el quaternion tiene w=0, el IMU aún no ha enviado nada válido
-        if (data == null || data.orientation.w == 0f) return Quaternion.identity;
-
-        // Aplicar la rotación de montaje y normalizar para evitar drift numérico
-        return Quaternion.Euler(tracker.mountingRotation) * data.orientation.normalized;
+        DeviceData deviceData = BLEManager.Instance.GetDeviceByName(tracker.assignedName);
+        if (deviceData == null || deviceData.orientation.w == 0f) return Quaternion.identity;
+        return Quaternion.Euler(tracker.mountingRotation) * deviceData.orientation.normalized;
     }
-
-    // ── Filtro de falsos positivos de mano ───────────────────────────
-    // Problema original: con ciertas luces, YOLO detectaba un cubo donde solo
-    // había un puño cerrado o semicerrado. Esto hacía que la posición del cubo
-    // digital saltase entre su posición real y la mano.
-    //
-    // Solución: cruzar la posición de la detección con el FSR (sensor de presión).
-    // Si la detección está cerca de la mano Y el FSR dice que no hay presión,
-    // es un falso positivo y lo descartamos.
 
     private bool IsHandFalsePositive(FusionTracker tracker, Vector3 detectedPos)
     {
-        // Si no tenemos referencia de la mano o no está siendo trackeada,
-        // no podemos filtrar nada. Al arrancar, OVRHand puede estar en (0,0,0)
-        // y eso causaría rechazos falsos.
-        if (_activeHand == null || !_activeHand.IsTracked) return false;
-
-        // ¿Está la detección cerca de la mano?
-        float dist = Vector3.Distance(detectedPos, _activeHand.transform.position);
-        if (dist > handFPMaxDistance) return false;
-
-        // Sí está cerca. Ahora preguntamos: ¿el usuario realmente tiene un cubo en la mano?
-        // Si el tracker dice que está en grip → la detección es legítima, es el cubo real.
+        // Durante agarre real no se filtra; fuera de agarre se respeta la evaluacion de contacto.
         if (tracker.IsGripping) return false;
-
-        // Doble check leyendo el valor raw del FSR directamente.
-        // Esto cubre el caso edge donde el usuario acaba de agarrar el cubo
-        // pero la máquina de estados de grip aún no ha transicionado.
-        if (BLEManager.Instance != null)
-        {
-            DeviceData data = BLEManager.Instance.GetDeviceByName(tracker.assignedName);
-            if (data != null && data.grip >= tracker.gripThresholdEnter)
-                return false;   // Hay presión en el FSR → cubo real en mano
-        }
-
-        // Cerca de la mano + sin presión FSR → casi seguro que YOLO ve el puño
-        return true;
+        return tracker.contactAssessor.ShouldFilterAsHandFP;
     }
 
-    // ── Utilidades ───────────────────────────────────────────────────
-
-    // Cuenta cuántos keypoints son válidos en este frame.
-    // Un keypoint es inválido cuando YOLO no lo detectó o su confianza es muy baja.
-    private static int CountValidKeypoints(bool[] kptsValid)
-    {
-        if (kptsValid == null) return 0;
-
-        int count = 0;
-        for (int i = 0; i < kptsValid.Length; i++)
-        {
-            if (kptsValid[i]) count++;
-        }
-        return count;
-    }
 }
