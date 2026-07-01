@@ -12,7 +12,7 @@ Este trabajo se enmarca en la línea de investigación del grupo **AIR (Artifici
 - **Proyecto asociado:** REHAB-IMMERSIVE — Plataforma de Realidad Virtual inmersiva para la rehabilitación de miembros superiores
 - **Financiación:** Ministerio de Ciencia e Innovación (MCIN/AEI)
 - **Código de referencia:** PID2020-117361RB-C21
-- **Investigadores principales:** Carlos González Morcillo y [Javier A. Albusac Jiménez](https://www.esi.uclm.es/www/jalbusac/)
+- **Investigadores principales:**  [Javier A. Albusac Jiménez](https://www.esi.uclm.es/www/jalbusac/) y Carlos González Morcillo 
 - **Colaborador clínico:** Hospital Nacional de Parapléjicos de Toledo (HNPT)
 
 ## Contenido del repositorio
