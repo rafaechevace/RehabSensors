@@ -1,0 +1,5 @@
+west:
+  command: /home/rafael/zephyrproject/.venv/bin/west build -b xiao_ble/nrf52840/sense
+    /home/rafael/zephyrproject/myProjects/rehab --pristine
+  topdir: /home/rafael/zephyrproject
+  version: 1.4.0
