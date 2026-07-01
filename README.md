@@ -9,10 +9,10 @@ El sistema, implementado en Unity para Meta Quest 3, integra el seguimiento de u
 Este trabajo se enmarca en la línea de investigación del grupo **AIR (Artificial Intelligence and Representation)** de la Escuela Superior de Informática (ESI), Universidad de Castilla-La Mancha (UCLM), en colaboración clínica con el **Hospital Nacional de Parapléjicos de Toledo (HNPT)**.
 
 - **Grupo de investigación:** AIR — [air.esi.uclm.es](https://air.esi.uclm.es/air/)
-- **Proyecto asociado:** REHAB-IMMERSIVE — Plataforma de Realidad Virtual inmersiva para la rehabilitación de miembros superiores
+- **Proyecto asociado:** [REHAB-IMMERSIVE](https://air.esi.uclm.es/rehab/) — Plataforma de Realidad Virtual inmersiva para la rehabilitación de miembros superiores
 - **Financiación:** Ministerio de Ciencia e Innovación (MCIN/AEI)
 - **Código de referencia:** PID2020-117361RB-C21
-- **Investigadores principales:**  [Javier A. Albusac Jiménez](https://www.esi.uclm.es/www/jalbusac/) y Carlos González Morcillo 
+- **Investigadores principales:** Carlos González Morcillo y [Javier A. Albusac Jiménez](https://www.esi.uclm.es/www/jalbusac/)
 - **Colaborador clínico:** Hospital Nacional de Parapléjicos de Toledo (HNPT)
 
 ## Contenido del repositorio
